@@ -25,7 +25,7 @@ def now_vn():
 
 # --- 2. CẤU HÌNH TOKEN & GEMINI API KEY ---
 # Ưu tiên lấy từ Environment của Render, nếu chưa cài thì dùng mã mặc định bên phải
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "MTU0OTM1MTY1MDE3NzcxNjMwNw.GAbu2Z.0tq52YrvJVOgIqIzcjbrbwWKyRFJDPY8Qn7AZU")
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDuOEYpg2d5bZxxxVDU3FrTZm_Ist1DLbE")
 DATA_FILE = "production_data.json"
 
