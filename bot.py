@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 
 # --- 1. CẤU HÌNH API TRỰC TIẾP ---
-DISCORD_TOKEN = "MTU0OTM1MTY1MDE3NzcxNjMwNw.GCTcmA.ACcdYSvvm9mmkmE2bwwYXsZv7_rw4KONleN-LI"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = "AIzaSyDuOEYpg2d5bZxxxVDU3FrTZm_Ist1DLbE"
 TASK_FILE = "tasks.json"
 
