@@ -1,6 +1,5 @@
 discord.py
 google-genai
-openai
 Pillow
 aiohttp
 python-dotenv
