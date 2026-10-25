@@ -212,4 +212,4 @@ async def async_safe_generate_content(model_name, contents_list):
 # --- 8. SỰ KIỆN BOT & VÒNG LẶP CHẠY NGẦM ---
 @bot.event
 async def on_ready():
-    print(f"[SYSTEM] Bot đã sẵn sàng: {
+    print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
