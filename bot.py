@@ -23,9 +23,9 @@ VN_TZ = timezone(timedelta(hours=7))
 def now_vn():
     return datetime.now(VN_TZ).replace(tzinfo=None)
 
-# --- 2. CẤU HÌNH TOKEN & GEMINI API KEY ---
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDuOEYpg2d5bZxxxVDU3FrTZm_Ist1DLbE")
+# --- 2. CẤU HÌNH TOKEN & GEMINI API KEY (LẤY TỪ ENVIRONMENT CỦA RENDER) ---
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DATA_FILE = "production_data.json"
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
@@ -75,8 +75,15 @@ async def globally_block_unauthorized(ctx):
         return False
     return True
 
-# --- 5. HỆ THỐNG MÔ HÌNH GEMINI (DUY NHẤT GEMINI-3.8-FLASH HOẠT ĐỘNG) ---
-AI_MODEL_NAME = "gemini-3.8-flash"
+# --- 5. HỆ THỐNG MÔ HÌNH GEMINI (ĐÃ LOẠI BỎ 2.0-FLASH CŨ) ---
+AVAILABLE_MODELS = {
+    "gemini": "models/gemini-3.8-flash",
+    "3.8-flash": "models/gemini-3.8-flash",
+    "flash": "models/gemini-3.8-flash",
+    "2.5-flash": "models/gemini-2.5-flash",
+}
+
+DEFAULT_MODEL = "gemini"
 
 SYSTEM_PROMPT = (
     "Bạn là chuyên gia Production House, hội tụ tư duy của Art Director, Creative Director, Producer, DI Artist và Visual Artist. "
@@ -130,19 +137,35 @@ def extract_topic(text):
     text = re.sub(r'\b(ngày|lúc|vào)\b', '', text, flags=re.IGNORECASE)
     return ' '.join(text.split()).strip()
 
-# --- 7. HÀM GỌI GEMINI API BẤT ĐỒNG BỘ ---
-async def async_safe_generate_content(contents_list):
-    return await client_ai.aio.models.generate_content(
-        model=AI_MODEL_NAME,
-        contents=contents_list,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-    )
+# --- 7. HÀM GỌI GEMINI API BẤT ĐỒNG BỘ (CHỈ DÙNG MODEL MỚI & HIỆN ĐÚNG LỖI GỐC) ---
+async def async_safe_generate_content(model_name, contents_list):
+    fallback_sequence = [
+        model_name,
+        "models/gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "models/gemini-2.5-flash",
+    ]
+    models_to_try = list(dict.fromkeys(fallback_sequence))
+    
+    first_error = None
+    for m in models_to_try:
+        try:
+            return await client_ai.aio.models.generate_content(
+                model=m,
+                contents=contents_list,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            )
+        except Exception as e:
+            if first_error is None:
+                first_error = e  # Lưu lại lỗi của model đầu tiên thay vì model cuối
+            continue
+                
+    raise first_error
 
 # --- 8. SỰ KIỆN BOT & VÒNG LẶP CHẠY NGẦM ---
 @bot.event
 async def on_ready():
     print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
-    print(f"[SYSTEM] Đang sử dụng Model: {AI_MODEL_NAME}")
     if not check_deadlines.is_running():
         check_deadlines.start()
     if not check_meetings.is_running():
@@ -233,9 +256,10 @@ async def before_loops():
 # --- 9. LỆNH HƯỚNG DẪN (!huongdan / !help) ---
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
+    models_str = ", ".join(f"`{k}`" for k in AVAILABLE_MODELS.keys())
     embed = discord.Embed(
         title="🎬 CẨM NANG BOT PRODUCTION HOUSE",
-        description="Hệ thống quản lý tiến độ, lịch họp và trợ lý Gemini 3.8 Flash AI chuyên sâu.",
+        description="Hệ thống quản lý tiến độ, lịch họp và trợ lý Gemini 3.8 Flash chuyên sâu.",
         color=discord.Color.gold()
     )
     embed.add_field(
@@ -261,12 +285,13 @@ async def show_help(ctx):
     embed.add_field(
         name="🧠 3. Trợ lý AI & Duyệt WIP (Gemini 3.8 Flash)",
         value=(
-            "• `!ai [câu hỏi]` — Hỏi đáp AI Art Director (có nhớ ngữ cảnh)\n"
+            "• `!ai [câu hỏi]` — Hỏi đáp AI (có nhớ ngữ cảnh)\n"
             "• `!checkwip` (Đính kèm ảnh) — AI đóng vai Art Director/DI soi bố cục, ánh sáng, màu sắc\n"
             "• `!taoprompt [ý tưởng]` — Chuyển ý tưởng tiếng Việt thành Prompt tiếng Anh chuẩn\n"
             "• `!datten [tên file]` — Chuẩn hóa tên file theo quy chuẩn Production\n"
             "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện của bạn\n"
-            "👉 **Model đang sử dụng:** `gemini-3.8-flash` (Chuẩn Google mới nhất)"
+            "• `!checkapi` — Kiểm tra tình trạng API Key và danh sách Model khả dụng\n"
+            f"👉 **Các model hỗ trợ:** {models_str}"
         ),
         inline=False
     )
@@ -410,11 +435,28 @@ async def list_meetings(ctx):
     await send_long_message(ctx, msg)
 
 # --- 12. CÁC LỆNH AI & PRODUCTION ---
+@bot.command(name="checkapi")
+async def check_api(ctx):
+    """Lệnh kiểm tra xem API Key có hoạt động không và liệt kê các model khả dụng"""
+    try:
+        models = [m.name for m in client_ai.models.list() if "gemini" in m.name]
+        await ctx.send(f"✅ **API Key hoạt động tốt!**\nCác model khả dụng:\n`" + "`, `".join(models[:15]) + "`")
+    except Exception as e:
+        await ctx.send(f"❌ **API Key đang bị lỗi hoặc bị khóa:** `{str(e)[:300]}`")
+
 @bot.command(name="ai")
-async def ask_ai(ctx, *, prompt: str = None):
+async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
+    if model_key and model_key.lower() not in AVAILABLE_MODELS:
+        prompt = f"{model_key} {prompt}" if prompt else model_key
+        model_key = DEFAULT_MODEL
+    elif not model_key:
+        model_key = DEFAULT_MODEL
+
     if not prompt and not ctx.message.attachments:
         await ctx.send("⚠️ Vui lòng nhập câu hỏi hoặc đính kèm ảnh.")
         return
+    
+    selected_model = AVAILABLE_MODELS.get(model_key.lower(), AVAILABLE_MODELS[DEFAULT_MODEL])
 
     async with ctx.typing():
         try:
@@ -435,7 +477,7 @@ async def ask_ai(ctx, *, prompt: str = None):
                 image_bytes = await attachment.read()
                 contents.append(Image.open(io.BytesIO(image_bytes)))
 
-            response = await async_safe_generate_content(contents)
+            response = await async_safe_generate_content(selected_model, contents)
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             
             history.append({"user": user_text, "assistant": reply_text})
@@ -444,16 +486,18 @@ async def ask_ai(ctx, *, prompt: str = None):
 
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi AI: `{str(e)[:200]}`")
+            await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
 
 @bot.command(name="checkwip")
-async def check_wip(ctx):
+async def check_wip(ctx, model_key: str = "gemini"):
     if not ctx.message.attachments:
         await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP cùng với lệnh `!checkwip`.")
         return
     
+    selected_model = AVAILABLE_MODELS.get(model_key.lower(), AVAILABLE_MODELS[DEFAULT_MODEL])
     attachment = ctx.message.attachments[0]
-    await ctx.send(f"🔍 Đang soi WIP bằng AI Art Director (Gemini 3.8 Flash)...")
+    
+    await ctx.send(f"🔍 Đang soi WIP bằng AI chuyên môn...")
     async with ctx.typing():
         try:
             image_bytes = await attachment.read()
@@ -466,11 +510,11 @@ async def check_wip(ctx):
                 "3. Color Grading / Blending (Màu sắc & Hòa trộn) "
                 "4. Các điểm lỗi cần fix ngay."
             )
-            response = await async_safe_generate_content([prompt_wip, image])
+            response = await async_safe_generate_content(selected_model, [prompt_wip, image])
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:200]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
@@ -485,20 +529,20 @@ async def tao_prompt(ctx, *, idea: str):
     async with ctx.typing():
         try:
             prompt_req = f"Tạo prompt AI tiếng Anh chi tiết (gồm Subject, Environment, Lighting, Camera Angle, Render Style) từ ý tưởng: '{idea}'."
-            response = await async_safe_generate_content([prompt_req])
+            response = await async_safe_generate_content(AVAILABLE_MODELS[DEFAULT_MODEL], [prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:200]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="datten")
 async def dat_ten(ctx, *, filename: str):
     async with ctx.typing():
         try:
             prompt_req = f"Chuyển đổi tên file '{filename}' sang chuẩn đặt tên Production House (YYYYMMDD_Project_Asset_Version, không dấu, dùng underscore)."
-            response = await async_safe_generate_content([prompt_req])
+            response = await async_safe_generate_content(AVAILABLE_MODELS[DEFAULT_MODEL], [prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:200]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="nopfile")
 async def nop_file(ctx, *, project_name: str = "Dự án chung"):
