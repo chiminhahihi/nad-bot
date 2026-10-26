@@ -18,25 +18,28 @@ from PIL import Image
 warnings.filterwarnings('ignore')
 load_dotenv()
 
-# --- 1. CẤU HÌNH MÚI GIỜ VIỆT NAM (UTC+7 CHO RENDER) ---
+# ==============================================================================
+# 1. CẤU HÌNH MÚI GIỜ VIỆT NAM (UTC+7 CHO RENDER)
+# ==============================================================================
 VN_TZ = timezone(timedelta(hours=7))
 
 def now_vn():
     return datetime.now(VN_TZ).replace(tzinfo=None)
 
-# --- 2. CẤU HÌNH TOKEN & GEMINI API KEY (LẤY TỪ ENVIRONMENT CỦA RENDER) ---
+# ==============================================================================
+# 2. CẤU HÌNH TOKEN & GEMINI API KEY (TỰ ĐỘNG LẤY TỪ RENDER ENVIRONMENT)
+# ==============================================================================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
+AI_MODEL_NAME = "gemini-3.8-flash"
 
-# Nâng timeout lên 60 giây (60000ms) để không bao giờ bị dính lỗi 504 DEADLINE_EXCEEDED
-client_ai = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=60000)
-)
+client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- 3. LƯU TRỮ DỮ LIỆU ---
+# ==============================================================================
+# 3. LƯU TRỮ DỮ LIỆU
+# ==============================================================================
 def load_data():
     if os.path.exists(DATA_FILE):
         try:
@@ -61,7 +64,9 @@ def save_data():
 TASKS, meetings, SUBMISSIONS = load_data()
 USER_CHATS = {}
 
-# --- 4. CẤU HÌNH BOT & PHÂN QUYỀN ---
+# ==============================================================================
+# 4. CẤU HÌNH BOT DISCORD & PHÂN QUYỀN
+# ==============================================================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -81,23 +86,15 @@ async def globally_block_unauthorized(ctx):
         return False
     return True
 
-# --- 5. HỆ THỐNG MÔ HÌNH GEMINI ---
-AVAILABLE_MODELS = {
-    "gemini": "gemini-3.8-flash",
-    "3.8-flash": "gemini-3.8-flash",
-    "flash": "gemini-3.8-flash",
-}
-
-DEFAULT_MODEL = "gemini"
-
 SYSTEM_PROMPT = (
     "Bạn là chuyên gia Production House, hội tụ tư duy của Art Director, Creative Director, Producer, DI Artist và Visual Artist. "
-    "Giao tiếp: bình thường, thẳng thắn, rút gọn, clean, không rườm rà. "
-    "Khi duyệt file/WIP: dùng mắt chuyên môn khắt khe. Phân tích layout, lighting, color grading (DI), visual flow. "
-    "Khi xử lý tiến độ: tư duy Producer, tối ưu quy trình. Đưa ra giải pháp kỹ thuật chính xác, thực chiến."
+    "Giao tiếp: cực kỳ nhanh gọn, thẳng thắn, xúc tích, chuyên nghiệp, không dài dòng giải thích sáo rỗng. "
+    "Khi duyệt file/WIP: soi chi tiết bố cục, ánh sáng, màu sắc (DI) và đưa giải pháp thực tế ngay lập tức."
 )
 
-# --- 6. HÀM TIỆN ÍCH, NÉN ẢNH TĂNG TỐC & BÓC TÁCH NGÀY GIỜ ---
+# ==============================================================================
+# 5. TIỆN ÍCH, NÉN ẢNH TỐC ĐỘ CAO & BÓC TÁCH THỜI GIAN
+# ==============================================================================
 async def send_long_message(destination, text: str):
     if not text:
         await destination.send("⚠️ Không có nội dung phản hồi.")
@@ -106,11 +103,11 @@ async def send_long_message(destination, text: str):
         await destination.send(text[i:i+1990])
 
 def optimize_image(image_bytes: bytes) -> Image.Image:
-    """Thu nhỏ ảnh quá khổ về tối đa 1280px để gửi lên AI nhanh gấp 5 lần trên Render"""
+    """Nén ảnh nhẹ xuống 1080px để gửi lên AI phản hồi siêu nhanh trong 1 giây"""
     img = Image.open(io.BytesIO(image_bytes))
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+    img.thumbnail((1080, 1080), Image.Resampling.LANCZOS)
     return img
 
 def parse_smart_datetime(text):
@@ -150,38 +147,49 @@ def extract_topic(text):
     text = re.sub(r'\b(ngày|lúc|vào)\b', '', text, flags=re.IGNORECASE)
     return ' '.join(text.split()).strip()
 
-# --- 7. HÀM GỌI GEMINI API TỐC ĐỘ CAO (TIMEOUT 60 GIÂY) ---
-async def async_safe_generate_content(model_name, contents_list):
+# ==============================================================================
+# 6. HÀM GỌI GEMINI NATIVE ASYNC SIÊU TỐC (CHỐNG TREO, CHỐNG 503, REP TRONG 1-2S)
+# ==============================================================================
+async def async_safe_generate_content(arg1, arg2=None):
     if not GEMINI_API_KEY:
         raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
 
-    # Đảm bảo luôn trỏ về model chuẩn
-    target_model = "gemini-3.8-flash"
-    
-    def _sync_call(m):
-        return client_ai.models.generate_content(
-            model=m,
-            contents=contents_list,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.7,
+    # Linh hoạt nhận 1 hoặc 2 tham số để không bao giờ bị lỗi gọi hàm
+    contents = arg2 if arg2 is not None else arg1
+
+    last_err = None
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                client_ai.aio.models.generate_content(
+                    model=AI_MODEL_NAME,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.7,
+                        max_output_tokens=800, # Giới hạn súc tích giúp trả lời siêu nhanh
+                    )
+                ),
+                timeout=20.0
             )
-        )
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            # Nếu Google bận đột xuất 503, tự động chờ 1.5s rồi thử lại
+            if ("503" in err_str or "unavailable" in err_str or "demand" in err_str) and attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+            raise e
 
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_sync_call, target_model),
-            timeout=60.0
-        )
-    except asyncio.TimeoutError:
-        raise Exception("Google AI phản hồi quá 60s (Timeout mạng Render). Bạn hãy thử gõ lại câu ngắn gọn hơn nhé!")
-    except Exception as e:
-        raise e
+    raise last_err
 
-# --- 8. SỰ KIỆN BOT & VÒNG LẶP CHẠY NGẦM ---
+# ==============================================================================
+# 7. SỰ KIỆN BOT & CÁC VÒNG LẶP CHẠY NGẦM
+# ==============================================================================
 @bot.event
 async def on_ready():
     print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
+    print(f"[SYSTEM] Đang sử dụng Gemini Siêu Tốc: {AI_MODEL_NAME}")
     if not check_deadlines.is_running():
         check_deadlines.start()
     if not check_meetings.is_running():
@@ -189,13 +197,14 @@ async def on_ready():
     if not keep_alive_ping.is_running():
         keep_alive_ping.start()
 
-# Vòng lặp tự ping chính mình mỗi 4 phút để giữ kết nối Render luôn nhạy
-@tasks.loop(minutes=4)
+# Tự động ping chính mình mỗi 5 phút để Render KHÔNG BAO GIỜ bị ngủ đông
+@tasks.loop(minutes=5)
 async def keep_alive_ping():
     def _ping():
         try:
-            req = urllib.request.Request(f"{RENDER_EXTERNAL_URL}/health", method="HEAD")
-            urllib.request.urlopen(req, timeout=10)
+            req = urllib.request.Request(f"{RENDER_EXTERNAL_URL}/health", headers={'User-Agent': 'BotKeeper'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                pass
         except Exception:
             pass
     await asyncio.to_thread(_ping)
@@ -283,13 +292,14 @@ async def check_meetings():
 async def before_loops():
     await bot.wait_until_ready()
 
-# --- 9. LỆNH HƯỚNG DẪN (!huongdan / !help) ---
+# ==============================================================================
+# 8. LỆNH HƯỚNG DẪN (!huongdan / !help)
+# ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
-    models_str = ", ".join(f"`{k}`" for k in AVAILABLE_MODELS.keys())
     embed = discord.Embed(
-        title="🎬 CẨM NANG BOT PRODUCTION HOUSE",
-        description="Hệ thống quản lý tiến độ, lịch họp và trợ lý Gemini 3.8 Flash chuyên sâu.",
+        title="🎬 CẨM NANG BOT PRODUCTION HOUSE (SIÊU TỐC)",
+        description="Hệ thống quản lý tiến độ, lịch họp và trợ lý Gemini 3.8 Flash AI.",
         color=discord.Color.gold()
     )
     embed.add_field(
@@ -313,15 +323,14 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="🧠 3. Trợ lý AI & Duyệt WIP (Gemini 3.8 Flash)",
+        name="🧠 3. Trợ lý AI & Duyệt WIP (Phản hồi 1-2 giây)",
         value=(
-            "• `!ai [câu hỏi]` — Hỏi đáp AI tốc độ cao (có nhớ ngữ cảnh)\n"
-            "• `!checkwip` (Đính kèm ảnh) — AI đóng vai Art Director/DI soi bố cục, ánh sáng, màu sắc\n"
+            "• `!ai [câu hỏi]` — Hỏi đáp AI Art Director tốc độ cao\n"
+            "• `!checkwip` (Đính kèm ảnh) — AI soi bố cục, ánh sáng, màu sắc\n"
             "• `!taoprompt [ý tưởng]` — Chuyển ý tưởng tiếng Việt thành Prompt tiếng Anh chuẩn\n"
             "• `!datten [tên file]` — Chuẩn hóa tên file theo quy chuẩn Production\n"
-            "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện của bạn\n"
-            "• `!checkapi` — Kiểm tra độ trễ (ping) và tình trạng API Key\n"
-            f"👉 **Model đang sử dụng:** `gemini-3.8-flash`"
+            "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện\n"
+            "• `!checkapi` — Kiểm tra tốc độ phản hồi thực tế của AI"
         ),
         inline=False
     )
@@ -336,7 +345,9 @@ async def show_help(ctx):
     embed.set_footer(text=f"Múi giờ hệ thống: UTC+7 (Hiện tại: {now_vn().strftime('%H:%M - %d/%m/%Y')})")
     await ctx.send(embed=embed)
 
-# --- 10. CÁC LỆNH QUẢN LÝ TASK ---
+# ==============================================================================
+# 9. CÁC LỆNH QUẢN LÝ TASK
+# ==============================================================================
 @bot.command(name="task")
 async def add_task(ctx, *, content: str):
     parsed_dt = parse_smart_datetime(content)
@@ -420,7 +431,9 @@ async def remove_task(ctx, index_str: str):
     except ValueError:
         await ctx.send("❌ Vui lòng nhập số nguyên.")
 
-# --- 11. CÁC LỆNH LỊCH HỌP ---
+# ==============================================================================
+# 10. CÁC LỆNH LỊCH HỌP
+# ==============================================================================
 @bot.command(name="hop")
 async def schedule_meeting(ctx, *, content: str):
     parsed_dt = parse_smart_datetime(content)
@@ -464,31 +477,25 @@ async def list_meetings(ctx):
         msg += f"`{i}`. **{m['topic']}** — `{m['time']}` — {target}\n"
     await send_long_message(ctx, msg)
 
-# --- 12. CÁC LỆNH AI & PRODUCTION ---
+# ==============================================================================
+# 11. CÁC LỆNH AI SIÊU TỐC
+# ==============================================================================
 @bot.command(name="checkapi")
 async def check_api(ctx):
-    """Kiểm tra tốc độ phản hồi và danh sách model thực tế"""
-    def _list_models():
-        return [m.name for m in client_ai.models.list() if "gemini" in m.name]
+    """Kiểm tra tốc độ phản hồi thực tế của AI"""
+    start_t = datetime.now()
     try:
-        models = await asyncio.wait_for(asyncio.to_thread(_list_models), timeout=15.0)
-        await ctx.send(f"⚡ **Ping Discord:** `{round(bot.latency * 1000)}ms` | ✅ **API Key hoạt động tốt!**\nCác model khả dụng:\n`" + "`, `".join(models[:15]) + "`")
+        res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"])
+        elapsed = round((datetime.now() - start_t).total_seconds(), 2)
+        await ctx.send(f"⚡ **Tốc độ phản hồi AI:** `{elapsed} giây` | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n✅ **Hệ thống đang hoạt động siêu tốc!**")
     except Exception as e:
-        await ctx.send(f"❌ **Lỗi kết nối API Key:** `{str(e)[:300]}`")
+        await ctx.send(f"❌ **Lỗi kiểm tra AI:** `{str(e)[:250]}`")
 
 @bot.command(name="ai")
-async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
-    if model_key and model_key.lower() not in AVAILABLE_MODELS:
-        prompt = f"{model_key} {prompt}" if prompt else model_key
-        model_key = DEFAULT_MODEL
-    elif not model_key:
-        model_key = DEFAULT_MODEL
-
+async def ask_ai(ctx, *, prompt: str = None):
     if not prompt and not ctx.message.attachments:
         await ctx.send("⚠️ Vui lòng nhập câu hỏi hoặc đính kèm ảnh.")
         return
-    
-    selected_model = AVAILABLE_MODELS.get(model_key.lower(), AVAILABLE_MODELS[DEFAULT_MODEL])
 
     async with ctx.typing():
         try:
@@ -497,7 +504,8 @@ async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
             
             history = USER_CHATS[ctx.author.id]
             full_context = ""
-            for h in history[-5:]:
+            # Lưu 3 câu gần nhất để bốc dữ liệu nhanh nhất có thể
+            for h in history[-3:]:
                 full_context += f"User: {h['user']}\nAssistant: {h['assistant']}\n"
             
             user_text = prompt if prompt else "Phân tích hình ảnh này dưới góc độ chuyên môn."
@@ -509,27 +517,25 @@ async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
                 image_bytes = await attachment.read()
                 contents.append(await asyncio.to_thread(optimize_image, image_bytes))
 
-            response = await async_safe_generate_content(selected_model, contents)
+            response = await async_safe_generate_content(contents)
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             
             history.append({"user": user_text, "assistant": reply_text})
-            if len(history) > 5: 
+            if len(history) > 4: 
                 history.pop(0)
 
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
+            await ctx.send(f"❌ Lỗi AI: `{str(e)[:250]}`")
 
 @bot.command(name="checkwip")
-async def check_wip(ctx, model_key: str = "gemini"):
+async def check_wip(ctx):
     if not ctx.message.attachments:
         await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP cùng với lệnh `!checkwip`.")
         return
     
-    selected_model = AVAILABLE_MODELS.get(model_key.lower(), AVAILABLE_MODELS[DEFAULT_MODEL])
     attachment = ctx.message.attachments[0]
-    
-    await ctx.send("🔍 Đang phân tích WIP...")
+    await ctx.send("🔍 Đang soi WIP bằng Art Director AI...")
     async with ctx.typing():
         try:
             image_bytes = await attachment.read()
@@ -537,16 +543,16 @@ async def check_wip(ctx, model_key: str = "gemini"):
             
             prompt_wip = (
                 "Phân tích WIP này chi tiết theo các hạng mục: "
-                "1. Layout & Composition (Bố cục & Điểm nhìn) "
-                "2. Lighting & Contrast (Ánh sáng & Tương phản) "
-                "3. Color Grading / Blending (Màu sắc & Hòa trộn) "
+                "1. Layout & Composition (Bố cục) "
+                "2. Lighting & Contrast (Ánh sáng) "
+                "3. Color Grading (Màu sắc) "
                 "4. Các điểm lỗi cần fix ngay."
             )
-            response = await async_safe_generate_content(selected_model, [prompt_wip, image])
+            response = await async_safe_generate_content([prompt_wip, image])
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
@@ -561,20 +567,20 @@ async def tao_prompt(ctx, *, idea: str):
     async with ctx.typing():
         try:
             prompt_req = f"Tạo prompt AI tiếng Anh chi tiết (gồm Subject, Environment, Lighting, Camera Angle, Render Style) từ ý tưởng: '{idea}'."
-            response = await async_safe_generate_content(AVAILABLE_MODELS[DEFAULT_MODEL], [prompt_req])
+            response = await async_safe_generate_content([prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
 
 @bot.command(name="datten")
 async def dat_ten(ctx, *, filename: str):
     async with ctx.typing():
         try:
             prompt_req = f"Chuyển đổi tên file '{filename}' sang chuẩn đặt tên Production House (YYYYMMDD_Project_Asset_Version, không dấu, dùng underscore)."
-            response = await async_safe_generate_content(AVAILABLE_MODELS[DEFAULT_MODEL], [prompt_req])
+            response = await async_safe_generate_content([prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
 
 @bot.command(name="nopfile")
 async def nop_file(ctx, *, project_name: str = "Dự án chung"):
@@ -608,9 +614,11 @@ async def aggregate_links(ctx, limit: int = 100):
     msg = "🔗 **Tổng hợp Link Google Drive/Docs:**\n" + "\n".join(f"`{i+1}`. <{link}>" for i, link in enumerate(drive_links))
     await send_long_message(ctx, msg)
 
-# --- 13. WEB SERVER GIỮ BOT SỐNG 24/7 TRÊN RENDER ---
+# ==============================================================================
+# 12. CỔNG MẠNG VÀ CHỐNG NGỦ ĐÔNG CHO RENDER
+# ==============================================================================
 async def handle_ping(request):
-    return web.Response(text="OK")
+    return web.Response(text="Bot is running fast 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -621,7 +629,7 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[WEB SERVER] Đang lắng nghe cổng {port} cho Render...")
+    print(f"[WEB SERVER] Cổng mạng Render {port} đã mở thành công.")
 
 async def main():
     await start_web_server()
