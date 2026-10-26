@@ -24,7 +24,6 @@ def now_vn():
     return datetime.now(VN_TZ).replace(tzinfo=None)
 
 # --- 2. CẤU HÌNH TOKEN & GEMINI API KEY ---
-# Ưu tiên lấy từ Environment của Render, nếu chưa cài thì dùng mã mặc định bên phải
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDuOEYpg2d5bZxxxVDU3FrTZm_Ist1DLbE")
 DATA_FILE = "production_data.json"
@@ -76,14 +75,12 @@ async def globally_block_unauthorized(ctx):
         return False
     return True
 
-# --- 5. HỆ THỐNG MÔ HÌNH GEMINI & GEMMA (ĐÃ BỎ OPENAI) ---
+# --- 5. HỆ THỐNG MÔ HÌNH GEMINI (CHUẨN MỚI 3.8 FLASH) ---
 AVAILABLE_MODELS = {
-    "gemini": "gemini-2.5-flash",
-    "2.5-flash": "gemini-2.5-flash",
-    "2.5-pro": "gemini-2.5-pro",
-    "2.5-lite": "gemini-2.5-flash-lite",
+    "gemini": "gemini-3.8-flash",
+    "flash": "gemini-3.8-flash",
+    "3.8-flash": "gemini-3.8-flash",
     "2.0-flash": "gemini-2.0-flash",
-    "gemma": "gemma-3-27b-it",
 }
 
 DEFAULT_MODEL = "gemini"
@@ -140,14 +137,12 @@ def extract_topic(text):
     text = re.sub(r'\b(ngày|lúc|vào)\b', '', text, flags=re.IGNORECASE)
     return ' '.join(text.split()).strip()
 
-# --- 7. HÀM GỌI GEMINI API BẤT ĐỒNG BỘ ---
+# --- 7. HÀM GỌI GEMINI API BẤT ĐỒNG BỘ (ĐÃ SỬA CHUỖI DỰ PHÒNG CHUẨN) ---
 async def async_safe_generate_content(model_name, contents_list):
     fallback_sequence = [
         model_name,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-        "gemma-3-27b-it"
+        "gemini-3.8-flash",
+        "gemini-2.0-flash"
     ]
     models_to_try = list(dict.fromkeys(fallback_sequence))
     
@@ -286,10 +281,10 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="🧠 3. Trợ lý AI & Duyệt WIP (Gemini / Gemma)",
+        name="🧠 3. Trợ lý AI & Duyệt WIP (Gemini 3.8)",
         value=(
-            "• `!ai [câu hỏi]` hoặc `!ai [model] [câu hỏi]` — Hỏi đáp AI (có nhớ ngữ cảnh)\n"
-            "• `!checkwip [model]` (Đính kèm ảnh) — AI đóng vai Art Director/DI soi bố cục, ánh sáng, màu sắc\n"
+            "• `!ai [câu hỏi]` — Hỏi đáp AI (có nhớ ngữ cảnh)\n"
+            "• `!checkwip` (Đính kèm ảnh) — AI đóng vai Art Director/DI soi bố cục, ánh sáng, màu sắc\n"
             "• `!taoprompt [ý tưởng]` — Chuyển ý tưởng tiếng Việt thành Prompt tiếng Anh chuẩn\n"
             "• `!datten [tên file]` — Chuẩn hóa tên file theo quy chuẩn Production\n"
             "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện của bạn\n"
@@ -484,13 +479,13 @@ async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
 @bot.command(name="checkwip")
 async def check_wip(ctx, model_key: str = "gemini"):
     if not ctx.message.attachments:
-        await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP cùng với lệnh `!checkwip [model]`.")
+        await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP cùng với lệnh `!checkwip`.")
         return
     
     selected_model = AVAILABLE_MODELS.get(model_key.lower(), AVAILABLE_MODELS[DEFAULT_MODEL])
     attachment = ctx.message.attachments[0]
     
-    await ctx.send(f"🔍 Đang soi WIP bằng model `{selected_model}`...")
+    await ctx.send(f"🔍 Đang soi WIP bằng AI chuyên môn...")
     async with ctx.typing():
         try:
             image_bytes = await attachment.read()
