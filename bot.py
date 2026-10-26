@@ -30,10 +30,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
 
-# Đặt timeout cứng ở tầng HTTP (20000ms = 20 giây) để không bao giờ bị treo vĩnh viễn
+# Nâng timeout lên 60 giây (60000ms) để không bao giờ bị dính lỗi 504 DEADLINE_EXCEEDED
 client_ai = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=20000)
+    http_options=types.HttpOptions(timeout=60000)
 )
 
 # --- 3. LƯU TRỮ DỮ LIỆU ---
@@ -83,10 +83,9 @@ async def globally_block_unauthorized(ctx):
 
 # --- 5. HỆ THỐNG MÔ HÌNH GEMINI ---
 AVAILABLE_MODELS = {
-    "gemini": "models/gemini-3.8-flash",
-    "3.8-flash": "models/gemini-3.8-flash",
-    "flash": "models/gemini-3.8-flash",
-    "2.5-flash": "models/gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
+    "3.8-flash": "gemini-3.8-flash",
+    "flash": "gemini-3.8-flash",
 }
 
 DEFAULT_MODEL = "gemini"
@@ -151,17 +150,13 @@ def extract_topic(text):
     text = re.sub(r'\b(ngày|lúc|vào)\b', '', text, flags=re.IGNORECASE)
     return ' '.join(text.split()).strip()
 
-# --- 7. HÀM GỌI GEMINI API TỐC ĐỘ CAO & CHỐNG TREO 100% ---
+# --- 7. HÀM GỌI GEMINI API TỐC ĐỘ CAO (TIMEOUT 60 GIÂY) ---
 async def async_safe_generate_content(model_name, contents_list):
     if not GEMINI_API_KEY:
         raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
 
-    fallback_sequence = [
-        model_name,
-        "models/gemini-3.8-flash",
-        "models/gemini-2.5-flash",
-    ]
-    models_to_try = list(dict.fromkeys(fallback_sequence))
+    # Đảm bảo luôn trỏ về model chuẩn
+    target_model = "gemini-3.8-flash"
     
     def _sync_call(m):
         return client_ai.models.generate_content(
@@ -173,25 +168,15 @@ async def async_safe_generate_content(model_name, contents_list):
             )
         )
 
-    first_error = None
-    for m in models_to_try:
-        try:
-            # Chạy trong thread riêng kèm khóa cắt tự động sau 22 giây (chống treo typing)
-            return await asyncio.wait_for(
-                asyncio.to_thread(_sync_call, m),
-                timeout=22.0
-            )
-        except asyncio.TimeoutError:
-            err = Exception(f"Model {m} phản hồi quá 22s (Timeout). Thử lại ngay!")
-            if first_error is None:
-                first_error = err
-            continue
-        except Exception as e:
-            if first_error is None:
-                first_error = e
-            continue
-                
-    raise first_error
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_sync_call, target_model),
+            timeout=60.0
+        )
+    except asyncio.TimeoutError:
+        raise Exception("Google AI phản hồi quá 60s (Timeout mạng Render). Bạn hãy thử gõ lại câu ngắn gọn hơn nhé!")
+    except Exception as e:
+        raise e
 
 # --- 8. SỰ KIỆN BOT & VÒNG LẶP CHẠY NGẦM ---
 @bot.event
@@ -336,7 +321,7 @@ async def show_help(ctx):
             "• `!datten [tên file]` — Chuẩn hóa tên file theo quy chuẩn Production\n"
             "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện của bạn\n"
             "• `!checkapi` — Kiểm tra độ trễ (ping) và tình trạng API Key\n"
-            f"👉 **Các model hỗ trợ:** {models_str}"
+            f"👉 **Model đang sử dụng:** `gemini-3.8-flash`"
         ),
         inline=False
     )
@@ -486,7 +471,7 @@ async def check_api(ctx):
     def _list_models():
         return [m.name for m in client_ai.models.list() if "gemini" in m.name]
     try:
-        models = await asyncio.wait_for(asyncio.to_thread(_list_models), timeout=10.0)
+        models = await asyncio.wait_for(asyncio.to_thread(_list_models), timeout=15.0)
         await ctx.send(f"⚡ **Ping Discord:** `{round(bot.latency * 1000)}ms` | ✅ **API Key hoạt động tốt!**\nCác model khả dụng:\n`" + "`, `".join(models[:15]) + "`")
     except Exception as e:
         await ctx.send(f"❌ **Lỗi kết nối API Key:** `{str(e)[:300]}`")
@@ -512,7 +497,6 @@ async def ask_ai(ctx, model_key: str = None, *, prompt: str = None):
             
             history = USER_CHATS[ctx.author.id]
             full_context = ""
-            # Giữ tối đa 5 lượt hội thoại gần nhất để phản hồi nhanh nhất
             for h in history[-5:]:
                 full_context += f"User: {h['user']}\nAssistant: {h['assistant']}\n"
             
