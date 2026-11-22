@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import string
+import base64
 import urllib.request
 from datetime import datetime, timezone, timedelta
 import aiohttp
@@ -32,10 +33,16 @@ def now_vn():
 # ==============================================================================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
-AI_MODEL_NAME = "gemini-3.8-flash"
+
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -47,10 +54,15 @@ def load_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data.get("tasks", []), data.get("meetings", []), data.get("submissions", [])
+                return (
+                    data.get("tasks", []),
+                    data.get("meetings", []),
+                    data.get("submissions", []),
+                    data.get("active_model", "")
+                )
         except Exception:
             pass
-    return [], [], []
+    return [], [], [], ""
 
 def save_data():
     try:
@@ -58,12 +70,13 @@ def save_data():
             json.dump({
                 "tasks": TASKS,
                 "meetings": meetings,
-                "submissions": SUBMISSIONS
+                "submissions": SUBMISSIONS,
+                "active_model": ACTIVE_MODEL
             }, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"Lỗi lưu dữ liệu: {e}")
 
-TASKS, meetings, SUBMISSIONS = load_data()
+TASKS, meetings, SUBMISSIONS, ACTIVE_MODEL = load_data()
 USER_CHATS = {}
 
 # ==============================================================================
@@ -105,7 +118,7 @@ async def send_long_message(destination, text: str):
         await destination.send(text[i:i+1990])
 
 def optimize_image(image_bytes: bytes) -> Image.Image:
-    """Nén ảnh nhẹ xuống 1080px để gửi lên AI phản hồi siêu nhanh trong 1 giây"""
+    """Nén ảnh nhẹ xuống 1080px để gửi lên AI phản hồi siêu nhanh"""
     img = Image.open(io.BytesIO(image_bytes))
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
@@ -150,40 +163,98 @@ def extract_topic(text):
     return ' '.join(text.split()).strip()
 
 # ==============================================================================
-# 6. HÀM GỌI GEMINI NATIVE ASYNC SIÊU TỐC (CHỐNG TREO, CHỐNG 503, REP TRONG 1-2S)
+# 6. HÀM GỌI ĐA NỀN TẢNG (GOOGLE GEMINI + OPENROUTER) & TỰ ĐỘNG FALLBACK
 # ==============================================================================
-async def async_safe_generate_content(arg1, arg2=None):
-    if not GEMINI_API_KEY:
-        raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
+class AIResponseWrapper:
+    def __init__(self, text: str, model_used: str):
+        self.text = text
+        self.model_used = model_used
 
+def is_openrouter_model(model_name: str) -> bool:
+    """Model OpenRouter có dạng 'hang/ten-model' (không bắt đầu bằng 'models/')"""
+    return "/" in model_name and not model_name.startswith("models/")
+
+async def call_single_model(model_name: str, contents):
+    """Gọi đích danh 1 model (tự nhận diện Google Gemini hoặc OpenRouter)"""
+    if is_openrouter_model(model_name):
+        if not OPENROUTER_API_KEY:
+            raise Exception("Model dạng 'hãng/tên-model' cần gắn OPENROUTER_API_KEY trên Render!")
+
+        user_parts = []
+        items = contents if isinstance(contents, list) else [contents]
+        for item in items:
+            if isinstance(item, str):
+                user_parts.append({"type": "text", "text": item})
+            elif isinstance(item, Image.Image):
+                buf = io.BytesIO()
+                item.save(buf, format="JPEG", quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                user_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                })
+
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_parts}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 800,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=25)
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    err_msg = data.get("error", {}).get("message", str(data))
+                    raise Exception(f"OpenRouter {resp.status}: {err_msg}")
+                text = data["choices"][0]["message"]["content"]
+                return AIResponseWrapper(text=text, model_used=model_name)
+    else:
+        if not GEMINI_API_KEY:
+            raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
+        res = await asyncio.wait_for(
+            client_ai.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.7,
+                    max_output_tokens=800,
+                )
+            ),
+            timeout=20.0
+        )
+        return AIResponseWrapper(text=res.text, model_used=model_name)
+
+async def async_safe_generate_content(arg1, arg2=None):
     contents = arg2 if arg2 is not None else arg1
+    sequence = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + FALLBACK_MODELS
+    models_to_try = list(dict.fromkeys(sequence))
 
     last_err = None
-    for attempt in range(2):
+    for model_name in models_to_try:
         try:
-            return await asyncio.wait_for(
-                client_ai.aio.models.generate_content(
-                    model=AI_MODEL_NAME,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=0.7,
-                        max_output_tokens=800,
-                    )
-                ),
-                timeout=20.0
-            )
+            return await call_single_model(model_name, contents)
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            if ("503" in err_str or "unavailable" in err_str or "demand" in err_str) and attempt == 0:
-                await asyncio.sleep(1.5)
+            if any(k in err_str for k in ("503", "unavailable", "demand", "404", "overloaded", "timeout")):
                 continue
             raise e
 
     raise last_err
 
-# Hàm dùng chung để gọi Apify Scraper
 async def run_apify_actor(actor_id: str, payload: dict):
     if not APIFY_API_TOKEN:
         raise Exception("Chưa cấu hình APIFY_API_TOKEN trong mục Environment của Render!")
@@ -200,7 +271,7 @@ async def run_apify_actor(actor_id: str, payload: dict):
 @bot.event
 async def on_ready():
     print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
-    print(f"[SYSTEM] Đang sử dụng Gemini Siêu Tốc: {AI_MODEL_NAME}")
+    print(f"[SYSTEM] Model ưu tiên: {ACTIVE_MODEL or 'Auto'} | Dự phòng: {', '.join(FALLBACK_MODELS)}")
     if not check_deadlines.is_running():
         check_deadlines.start()
     if not check_meetings.is_running():
@@ -213,7 +284,7 @@ async def keep_alive_ping():
     def _ping():
         try:
             req = urllib.request.Request(f"{RENDER_EXTERNAL_URL}/health", headers={'User-Agent': 'BotKeeper'})
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=10):
                 pass
         except Exception:
             pass
@@ -307,62 +378,58 @@ async def before_loops():
 # ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
+    current_m = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({FALLBACK_MODELS[0]})"
     embed = discord.Embed(
-        title="🎬 CẨM NANG BOT PRODUCTION HOUSE (SIÊU TỐC)",
-        description="Hệ thống quản lý tiến độ, lịch họp, soi Social Media & trợ lý Gemini 3.8 Flash AI.",
+        title="🎬 CẨM NANG BOT PRODUCTION HOUSE",
+        description=f"Model đang chạy: **`{current_m}`**",
         color=discord.Color.gold()
     )
     embed.add_field(
         name="📋 1. Quản lý Task & Deadline",
         value=(
-            "• `!task [Tên task] [Giờ] [Ngày]` — Tạo task & mở Thread riêng (VD: `!task Key Visual 18:00 28/10`)\n"
-            "• Nhắn `done` hoặc `xong` — Tự động báo hoàn thành task của bạn\n"
-            "• `!danhsachtask` — Xem toàn bộ danh sách task và số thứ tự\n"
-            "• `!hoanthanh [số]` — Đánh dấu xong task theo số thứ tự\n"
-            "• `!xoatask [số]` — Xóa task và đóng Thread tương ứng"
+            "• `!task [Tên task] [Giờ] [Ngày]` — Tạo task & mở Thread riêng\n"
+            "• Nhắn `done` hoặc `xong` — Tự động báo hoàn thành task\n"
+            "• `!danhsachtask` | `!hoanthanh [số]` | `!xoatask [số]`"
         ),
         inline=False
     )
     embed.add_field(
         name="📅 2. Quản lý Lịch họp",
         value=(
-            "• `!hop [Giờ] [Ngày] [Nội dung]` — Đặt lịch họp chung ping @everyone (VD: `!hop 20:30 26/10 Duyệt concept`)\n"
-            "• `!hoprieng [@User] [Giờ] [Ngày] [Nội dung]` — Đặt lịch họp riêng với thành viên\n"
-            "• `!danhsachhop` — Xem các lịch họp sắp tới"
+            "• `!hop [Giờ] [Ngày] [Nội dung]` — Họp chung (@everyone)\n"
+            "• `!hoprieng [@User] [Giờ] [Ngày] [Nội dung]` — Họp riêng\n"
+            "• `!danhsachhop` — Xem lịch họp sắp tới"
         ),
         inline=False
     )
     embed.add_field(
-        name="🧠 3. Trợ lý AI & Duyệt WIP (Phản hồi 1-2 giây)",
+        name="🧠 3. Trợ lý AI & Quản lý Model",
         value=(
-            "• `!ai [câu hỏi]` — Hỏi đáp AI Art Director tốc độ cao\n"
-            "• `!checkwip` (Đính kèm ảnh) — AI soi bố cục, ánh sáng, màu sắc\n"
-            "• `!taoprompt [ý tưởng]` — Chuyển ý tưởng tiếng Việt thành Prompt tiếng Anh chuẩn\n"
-            "• `!datten [tên file]` — Chuẩn hóa tên file theo quy chuẩn Production\n"
-            "• `!resetai` — Xóa lịch sử nhớ ngữ cảnh trò chuyện\n"
-            "• `!checkapi` — Kiểm tra tốc độ phản hồi thực tế của AI"
+            "• `!ai [câu hỏi]` — Hỏi đáp AI Art Director (kèm ảnh được)\n"
+            "• `!checkwip` (Kèm ảnh) — AI soi bố cục, ánh sáng, màu sắc\n"
+            "• `!taoprompt [ý tưởng]` | `!datten [tên file]` | `!resetai`\n"
+            "• `!listmodel` — Xem toàn bộ model thật trên Gemini Key\n"
+            "• `!setmodel [model_id]` — Đổi sang model bất kỳ (Google hoặc OpenRouter)\n"
+            "• `!setmodel auto` — Quay về chế độ tự động fallback\n"
+            "• `!checkapi` — Kiểm tra tốc độ & trạng thái các API Key"
         ),
         inline=False
     )
     embed.add_field(
         name="🌐 4. Soi Trend & Đối thủ (TikTok / FB / IG / X)",
         value=(
-            "• `!soitiktok [link]` — Kéo thông số video TikTok & AI phân tích Hook/Visual\n"
-            "• `!soifb [link]` — Soi bài viết Facebook & đánh giá tương tác/nội dung\n"
-            "• `!soiig [link]` — Soi bài đăng/Reels Instagram & gợi ý góc làm Visual\n"
-            "• `!soix [link]` — Soi bài đăng X (Twitter) & phân tích insight"
+            "• `!soitiktok [link]` | `!soifb [link]` | `!soiig [link]` | `!soix [link]`"
         ),
         inline=False
     )
     embed.add_field(
         name="📁 5. Quản lý File & Link Dự án",
         value=(
-            "• `!nopfile [Tên dự án]` (Kèm file hoặc link) — Lưu trữ bản nộp vào hệ thống\n"
-            "• `!tonghoplink [số tin nhắn]` — Quét và gom toàn bộ link Google Drive/Docs trong kênh"
+            "• `!nopfile [Tên dự án]` (Kèm file/link) | `!tonghoplink [số tin nhắn]`"
         ),
         inline=False
     )
-    embed.set_footer(text=f"Múi giờ hệ thống: UTC+7 (Hiện tại: {now_vn().strftime('%H:%M - %d/%m/%Y')})")
+    embed.set_footer(text=f"Múi giờ: UTC+7 ({now_vn().strftime('%H:%M - %d/%m/%Y')})")
     await ctx.send(embed=embed)
 
 # ==============================================================================
@@ -498,19 +565,65 @@ async def list_meetings(ctx):
     await send_long_message(ctx, msg)
 
 # ==============================================================================
-# 11. CÁC LỆNH AI SIÊU TỐC
+# 11. CÁC LỆNH AI & QUẢN LÝ MODEL
 # ==============================================================================
+@bot.command(name="listmodel")
+async def list_models(ctx):
+    """Liệt kê toàn bộ mã Model ID thật mà GEMINI_API_KEY đang được dùng"""
+    async with ctx.typing():
+        try:
+            def _fetch():
+                return [m.name.replace("models/", "") for m in client_ai.models.list()]
+            models = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=15.0)
+            await send_long_message(
+                ctx,
+                "📋 **Các Model khả dụng trên Gemini Key của bạn:**\n`" + "`\n`".join(models) + "`\n\n"
+                "👉 Dùng `!setmodel [tên_model]` để chuyển ngay (hoặc nhập mã OpenRouter dạng `hãng/tên-model`)."
+            )
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi lấy danh sách model: `{str(e)[:250]}`")
+
+@bot.command(name="setmodel")
+async def set_model(ctx, model_id: str = None):
+    """Đổi model AI đang sử dụng (tự kiểm tra trước khi lưu): !setmodel [model_id / auto]"""
+    global ACTIVE_MODEL
+    if not model_id:
+        current = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({', '.join(FALLBACK_MODELS)})"
+        await ctx.send(f"ℹ️ Model hiện tại: **`{current}`**\nDùng `!setmodel [model_id]` để đổi hoặc `!setmodel auto` để tự động.")
+        return
+
+    if model_id.lower() == "auto":
+        ACTIVE_MODEL = ""
+        save_data()
+        await ctx.send(f"✅ Đã chuyển về chế độ **Auto Fallback**: `{', '.join(FALLBACK_MODELS)}`")
+        return
+
+    await ctx.send(f"🔄 Đang kiểm tra kết nối tới model **`{model_id}`**...")
+    async with ctx.typing():
+        try:
+            await call_single_model(model_id, ["Trả lời 1 chữ: OK"])
+            ACTIVE_MODEL = model_id
+            save_data()
+            source = "OpenRouter" if is_openrouter_model(model_id) else "Google Gemini"
+            await ctx.send(f"✅ Đã kích hoạt model **`{model_id}`** ({source}) thành công!")
+        except Exception as e:
+            await ctx.send(
+                f"❌ Không thể dùng model **`{model_id}`** (đã giữ nguyên model cũ).\n"
+                f"Lý do: `{str(e)[:250]}`"
+            )
+
 @bot.command(name="checkapi")
 async def check_api(ctx):
-    """Kiểm tra tốc độ phản hồi thực tế của AI"""
+    """Kiểm tra tốc độ phản hồi thực tế của AI và trạng thái các Key"""
     start_t = datetime.now()
     try:
         res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"])
         elapsed = round((datetime.now() - start_t).total_seconds(), 2)
-        apify_status = "✅ Đã gắn" if APIFY_API_TOKEN else "⚠️ Chưa gắn"
+        apify_status = "✅ Đã gắn" if APIFY_API_TOKEN else "⚪ Chưa gắn"
+        or_status = "✅ Đã gắn" if OPENROUTER_API_KEY else "⚪ Chưa gắn (tùy chọn)"
         await ctx.send(
-            f"⚡ **Tốc độ phản hồi AI:** `{elapsed} giây` | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n"
-            f"🔑 **Apify Token:** {apify_status}"
+            f"⚡ **Model phản hồi:** `{res.model_used}` (`{elapsed}s`) | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n"
+            f"🔑 **Apify:** {apify_status} | **OpenRouter:** {or_status}"
         )
     except Exception as e:
         await ctx.send(f"❌ **Lỗi kiểm tra AI:** `{str(e)[:250]}`")
