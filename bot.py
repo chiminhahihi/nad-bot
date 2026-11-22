@@ -40,8 +40,8 @@ DATA_FILE = "production_data.json"
 
 FALLBACK_MODELS = [
     "gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
 ]
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
@@ -205,14 +205,14 @@ async def call_single_model(model_name: str, contents):
                 {"role": "user", "content": user_parts}
             ],
             "temperature": 0.7,
-            "max_tokens": 800,
+            "max_tokens": 1500,
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=25)
+                timeout=aiohttp.ClientTimeout(total=35)
             ) as resp:
                 data = await resp.json()
                 if resp.status != 200:
@@ -230,10 +230,10 @@ async def call_single_model(model_name: str, contents):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.7,
-                    max_output_tokens=800,
+                    max_output_tokens=1500,
                 )
             ),
-            timeout=20.0
+            timeout=35.0
         )
         return AIResponseWrapper(text=res.text, model_used=model_name)
 
@@ -242,18 +242,21 @@ async def async_safe_generate_content(arg1, arg2=None):
     sequence = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + FALLBACK_MODELS
     models_to_try = list(dict.fromkeys(sequence))
 
-    last_err = None
+    errors = []
     for model_name in models_to_try:
         try:
             return await call_single_model(model_name, contents)
+        except asyncio.TimeoutError:
+            errors.append(f"{model_name}: Quá thời gian chờ (35s)")
+            continue
         except Exception as e:
-            last_err = e
             err_str = str(e).lower()
-            if any(k in err_str for k in ("503", "unavailable", "demand", "404", "overloaded", "timeout")):
+            errors.append(f"{model_name}: {str(e)[:80]}")
+            if any(k in err_str for k in ("503", "unavailable", "demand", "404", "overloaded", "timeout", "429", "quota")):
                 continue
             raise e
 
-    raise last_err
+    raise Exception(" | ".join(errors))
 
 async def run_apify_actor(actor_id: str, payload: dict):
     if not APIFY_API_TOKEN:
@@ -662,7 +665,7 @@ async def ask_ai(ctx, *, prompt: str = None):
 
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi AI: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
 
 @bot.command(name="checkwip")
 async def check_wip(ctx):
@@ -688,7 +691,7 @@ async def check_wip(ctx):
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             await send_long_message(ctx, reply_text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
@@ -706,7 +709,7 @@ async def tao_prompt(ctx, *, idea: str):
             response = await async_safe_generate_content([prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="datten")
 async def dat_ten(ctx, *, filename: str):
@@ -716,7 +719,7 @@ async def dat_ten(ctx, *, filename: str):
             response = await async_safe_generate_content([prompt_req])
             await send_long_message(ctx, response.text)
         except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="nopfile")
 async def nop_file(ctx, *, project_name: str = "Dự án chung"):
@@ -782,7 +785,7 @@ async def soi_tiktok(ctx, url: str):
             ai_res = await async_safe_generate_content([prompt])
             await send_long_message(ctx, f"🎵 **THÔNG SỐ TIKTOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
-            await ctx.send(f"❌ Lỗi soi TikTok: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi soi TikTok: `{str(e)[:300]}`")
 
 @bot.command(name="soifb")
 async def soi_fb(ctx, url: str):
@@ -809,7 +812,7 @@ async def soi_fb(ctx, url: str):
             ai_res = await async_safe_generate_content([prompt])
             await send_long_message(ctx, f"📘 **THÔNG SỐ FACEBOOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
-            await ctx.send(f"❌ Lỗi soi Facebook: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi soi Facebook: `{str(e)[:300]}`")
 
 @bot.command(name="soiig")
 async def soi_ig(ctx, url: str):
@@ -837,7 +840,7 @@ async def soi_ig(ctx, url: str):
             ai_res = await async_safe_generate_content([prompt])
             await send_long_message(ctx, f"📸 **THÔNG SỐ INSTAGRAM:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
-            await ctx.send(f"❌ Lỗi soi Instagram: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi soi Instagram: `{str(e)[:300]}`")
 
 @bot.command(name="soix")
 async def soi_x(ctx, url: str):
@@ -865,7 +868,7 @@ async def soi_x(ctx, url: str):
             ai_res = await async_safe_generate_content([prompt])
             await send_long_message(ctx, f"🐦 **THÔNG SỐ X (TWITTER):**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
-            await ctx.send(f"❌ Lỗi soi X: `{str(e)[:250]}`")
+            await ctx.send(f"❌ Lỗi soi X: `{str(e)[:300]}`")
 
 # ==============================================================================
 # 13. CỔNG MẠNG VÀ CHỐNG NGỦ ĐÔNG CHO RENDER
