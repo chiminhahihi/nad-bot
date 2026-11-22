@@ -1,4 +1,6 @@
 import os
+import gc
+import time
 import warnings
 import re
 import asyncio
@@ -38,10 +40,19 @@ APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
 
+MAX_RAW_DOWNLOAD_MB = 25   # Ngưỡng an toàn bảo vệ 512MB RAM của Render Free
+MAX_RAW_PIXELS = 45_000_000  # Chặn bung pixel >45MP với PNG/TIFF tránh sập RAM
+
 FALLBACK_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+]
+
+FAST_WIP_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
 ]
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
@@ -108,7 +119,7 @@ SYSTEM_PROMPT = (
 )
 
 # ==============================================================================
-# 5. TIỆN ÍCH, NÉN ẢNH TỐC ĐỘ CAO & BÓC TÁCH THỜI GIAN
+# 5. TIỆN ÍCH, XỬ LÝ ẢNH CHỐNG TRÀN RAM & HỖ TRỢ LINK GOOGLE DRIVE
 # ==============================================================================
 async def send_long_message(destination, text: str):
     if not text:
@@ -117,13 +128,98 @@ async def send_long_message(destination, text: str):
     for i in range(0, len(text), 1990):
         await destination.send(text[i:i+1990])
 
-def optimize_image(image_bytes: bytes) -> Image.Image:
-    """Nén ảnh nhẹ xuống 1080px để gửi lên AI phản hồi siêu nhanh"""
-    img = Image.open(io.BytesIO(image_bytes))
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    img.thumbnail((1080, 1080), Image.Resampling.LANCZOS)
-    return img
+def extract_gdrive_id(text: str):
+    if not text:
+        return None
+    m = re.search(r'(?:drive\.google\.com/file/d/|drive\.google\.com/open\?id=|id=)([a-zA-Z0-9_-]{20,})', text)
+    return m.group(1) if m else None
+
+def strip_gdrive_links(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r'https?://drive\.google\.com/[^\s]+', '', text)
+    return ' '.join(cleaned.split()).strip()
+
+def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 1024, quality: int = 80) -> bytes:
+    """Nén ảnh sang JPEG nhẹ an toàn, chống tràn RAM khi gặp file độ phân giải cực lớn"""
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        if img.format == "JPEG":
+            # Giải mã JPEG ở tỷ lệ thu nhỏ ngay từ tầng libjpeg để tiết kiệm RAM
+            img.draft("RGB", (max_size, max_size))
+        elif (img.width * img.height) > MAX_RAW_PIXELS:
+            raise Exception(
+                f"Ảnh có độ phân giải quá lớn ({img.width}x{img.height}px) dễ tràn RAM server. "
+                "Hãy gửi bản preview nhỏ hơn hoặc dùng link Google Drive (công khai)."
+            )
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((max_size, max_size), Image.Resampling.BILINEAR)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=False)
+        return buf.getvalue()
+
+async def fetch_safe_image_bytes(
+    attachment: discord.Attachment = None,
+    text: str = "",
+    max_size: int = 1024,
+    quality: int = 80
+) -> bytes:
+    """Ưu tiên kéo ảnh đã nén từ CDN Discord hoặc Google Drive Thumbnail — chống tràn RAM 100%"""
+    async with aiohttp.ClientSession() as session:
+        # 1. Nếu có link Google Drive (hỗ trợ cả PNG/TIFF/PSD >100MB mà không tải file gốc)
+        drive_id = extract_gdrive_id(text)
+        if drive_id and not attachment:
+            thumb_url = f"https://drive.google.com/thumbnail?id={drive_id}&sz=w{max_size}"
+            async with session.get(thumb_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                ctype = resp.headers.get("Content-Type", "").lower()
+                if resp.status == 200 and "image" in ctype:
+                    raw = await resp.read()
+                    res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                    del raw
+                    gc.collect()
+                    return res
+            raise Exception(
+                "Không lấy được ảnh từ Google Drive. Hãy bật quyền 'Bất kỳ ai có đường liên kết' "
+                "và đảm bảo đó là link file ảnh/PSD (không phải link thư mục)."
+            )
+
+        # 2. Nếu có ảnh đính kèm Discord: ép Discord CDN tự resize + chuyển JPEG trước
+        if attachment:
+            sep = "&" if "?" in attachment.proxy_url else "?"
+            fast_url = f"{attachment.proxy_url}{sep}format=jpeg&width={max_size}&height={max_size}"
+            try:
+                async with session.get(fast_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    clen = int(resp.headers.get("Content-Length") or 0)
+                    ctype = resp.headers.get("Content-Type", "").lower()
+                    if resp.status == 200 and "image" in ctype and clen < 10 * 1024 * 1024:
+                        raw = await resp.read()
+                        if len(raw) < 10 * 1024 * 1024:
+                            res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                            del raw
+                            gc.collect()
+                            return res
+                        del raw
+            except Exception:
+                pass
+
+            # 3. Chốt chặn an toàn nếu Discord không tạo được proxy (file quá nặng / sai định dạng)
+            size_mb = attachment.size / (1024 * 1024)
+            if size_mb > MAX_RAW_DOWNLOAD_MB:
+                raise Exception(
+                    f"File nặng {size_mb:.1f}MB vượt ngưỡng an toàn RAM ({MAX_RAW_DOWNLOAD_MB}MB). "
+                    "Hãy xuất bản JPEG preview nhẹ hoặc gửi link Google Drive (công khai) để bot soi trực tiếp."
+                )
+
+            raw = await attachment.read()
+            try:
+                res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                return res
+            finally:
+                del raw
+                gc.collect()
+
+    raise Exception("Không tìm thấy ảnh đính kèm hoặc link Google Drive hợp lệ.")
 
 def parse_smart_datetime(text):
     text = text.strip().lower()
@@ -192,6 +288,13 @@ async def call_single_model(model_name: str, contents):
                 user_parts.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                })
+            elif hasattr(item, "inline_data") and getattr(item.inline_data, "data", None):
+                mime = item.inline_data.mime_type or "image/jpeg"
+                b64 = base64.b64encode(item.inline_data.data).decode("utf-8")
+                user_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}
                 })
 
         headers = {
@@ -406,15 +509,13 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="🧠 3. Trợ lý AI & Quản lý Model",
+        name="🧠 3. Trợ lý AI & Duyệt WIP (Hỗ trợ ảnh & Link Drive >100MB)",
         value=(
-            "• `!ai [câu hỏi]` — Hỏi đáp AI Art Director (kèm ảnh được)\n"
-            "• `!checkwip` (Kèm ảnh) — AI soi bố cục, ánh sáng, màu sắc\n"
+            "• `!ai [câu hỏi / link Drive]` — Hỏi đáp AI Art Director (kèm ảnh hoặc link Drive)\n"
+            "• `!checkwip [link Drive / ghi chú]` (Hoặc đính kèm ảnh) — Soi WIP **siêu tốc** (chạy chữ live)\n"
+            "• `!checkwippro [link Drive / ghi chú]` (Hoặc đính kèm ảnh) — Soi WIP chuyên sâu chi tiết\n"
             "• `!taoprompt [ý tưởng]` | `!datten [tên file]` | `!resetai`\n"
-            "• `!listmodel` — Xem toàn bộ model thật trên Gemini Key\n"
-            "• `!setmodel [model_id]` — Đổi sang model bất kỳ (Google hoặc OpenRouter)\n"
-            "• `!setmodel auto` — Quay về chế độ tự động fallback\n"
-            "• `!checkapi` — Kiểm tra tốc độ & trạng thái các API Key"
+            "• `!listmodel` | `!setmodel [model_id / auto]` | `!checkapi`"
         ),
         inline=False
     )
@@ -633,8 +734,10 @@ async def check_api(ctx):
 
 @bot.command(name="ai")
 async def ask_ai(ctx, *, prompt: str = None):
-    if not prompt and not ctx.message.attachments:
-        await ctx.send("⚠️ Vui lòng nhập câu hỏi hoặc đính kèm ảnh.")
+    has_attachment = bool(ctx.message.attachments)
+    has_drive = bool(extract_gdrive_id(prompt or ""))
+    if not prompt and not has_attachment:
+        await ctx.send("⚠️ Vui lòng nhập câu hỏi, đính kèm ảnh hoặc dán link Google Drive.")
         return
 
     async with ctx.typing():
@@ -647,14 +750,15 @@ async def ask_ai(ctx, *, prompt: str = None):
             for h in history[-3:]:
                 full_context += f"User: {h['user']}\nAssistant: {h['assistant']}\n"
             
-            user_text = prompt if prompt else "Phân tích hình ảnh này dưới góc độ chuyên môn."
+            clean_prompt = strip_gdrive_links(prompt) if has_drive else (prompt or "")
+            user_text = clean_prompt if clean_prompt else "Phân tích hình ảnh này dưới góc độ chuyên môn."
             full_context += f"User: {user_text}\nAssistant:"
 
             contents = [full_context]
-            if ctx.message.attachments:
-                attachment = ctx.message.attachments[0]
-                image_bytes = await attachment.read()
-                contents.append(await asyncio.to_thread(optimize_image, image_bytes))
+            if has_attachment or has_drive:
+                attachment = ctx.message.attachments[0] if has_attachment else None
+                jpeg_bytes = await fetch_safe_image_bytes(attachment, prompt or "", max_size=1024, quality=80)
+                contents.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
 
             response = await async_safe_generate_content(contents)
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
@@ -668,26 +772,142 @@ async def ask_ai(ctx, *, prompt: str = None):
             await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
 
 @bot.command(name="checkwip")
-async def check_wip(ctx):
-    if not ctx.message.attachments:
-        await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP cùng với lệnh `!checkwip`.")
+async def check_wip(ctx, *, text: str = ""):
+    """Soi WIP siêu tốc (Hỗ trợ ảnh Discord & Link Drive >100MB, chạy chữ live)"""
+    has_attachment = bool(ctx.message.attachments)
+    has_drive = bool(extract_gdrive_id(text))
+    if not has_attachment and not has_drive:
+        await ctx.send("⚠️ Đính kèm ảnh WIP hoặc dán link Google Drive công khai cùng lệnh `!checkwip`.")
         return
-    
-    attachment = ctx.message.attachments[0]
-    await ctx.send("🔍 Đang soi WIP bằng Art Director AI...")
+    if not GEMINI_API_KEY:
+        await ctx.send("❌ Chưa cấu hình `GEMINI_API_KEY` trong mục Environment của Render!")
+        return
+
+    start_t = time.monotonic()
+    attachment = ctx.message.attachments[0] if has_attachment else None
+    status_msg = await ctx.send("⚡ Đang soi WIP...")
+
+    try:
+        jpeg_bytes = await fetch_safe_image_bytes(attachment, text, max_size=768, quality=75)
+        image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+
+        note = strip_gdrive_links(text)
+        extra_note = f"\nGhi chú thêm từ Artist: {note}" if note else ""
+
+        prompt_wip = (
+            f"Soi WIP siêu ngắn gọn (tối đa 160 chữ), gạch đầu dòng thẳng vào lỗi cần sửa:{extra_note}\n"
+            "• Bố cục/Layout:\n"
+            "• Ánh sáng/Contrast:\n"
+            "• Màu/DI/Blending:\n"
+            "• Fix gấp:"
+        )
+
+        full_text = ""
+        used_model = ""
+        errors = []
+
+        for model_name in FAST_WIP_MODELS:
+            try:
+                cfg_kwargs = {
+                    "system_instruction": SYSTEM_PROMPT,
+                    "temperature": 0.5,
+                    "max_output_tokens": 450,
+                }
+                try:
+                    if hasattr(types, "ThinkingConfig"):
+                        config = types.GenerateContentConfig(
+                            **cfg_kwargs,
+                            thinking_config=types.ThinkingConfig(thinking_budget=0)
+                        )
+                    else:
+                        config = types.GenerateContentConfig(**cfg_kwargs)
+
+                    stream = await asyncio.wait_for(
+                        client_ai.aio.models.generate_content_stream(
+                            model=model_name,
+                            contents=[prompt_wip, image_part],
+                            config=config
+                        ),
+                        timeout=15.0
+                    )
+                except Exception as te:
+                    if any(k in str(te).lower() for k in ("thinking", "400", "invalid", "unsupported")):
+                        config = types.GenerateContentConfig(**cfg_kwargs)
+                        stream = await asyncio.wait_for(
+                            client_ai.aio.models.generate_content_stream(
+                                model=model_name,
+                                contents=[prompt_wip, image_part],
+                                config=config
+                            ),
+                            timeout=15.0
+                        )
+                    else:
+                        raise te
+
+                used_model = model_name
+                last_edit = time.monotonic()
+
+                async for chunk in stream:
+                    if chunk.text:
+                        full_text += chunk.text
+                        now_t = time.monotonic()
+                        if now_t - last_edit >= 0.9 and full_text.strip():
+                            try:
+                                await status_msg.edit(content=f"{full_text[:1950]} ▌")
+                            except Exception:
+                                pass
+                            last_edit = now_t
+                break
+            except asyncio.TimeoutError:
+                errors.append(f"{model_name}: Timeout 15s")
+                full_text = ""
+                continue
+            except Exception as e:
+                errors.append(f"{model_name}: {str(e)[:70]}")
+                full_text = ""
+                continue
+
+        if not full_text:
+            raise Exception(" | ".join(errors) or "Không nhận được phản hồi từ AI.")
+
+        elapsed = round(time.monotonic() - start_t, 2)
+        footer = f"\n\n*⚡ `{used_model}` • `{elapsed}s`*"
+        if len(full_text) + len(footer) <= 2000:
+            await status_msg.edit(content=full_text + footer)
+        else:
+            await status_msg.edit(content=full_text[:1990])
+            await send_long_message(ctx, full_text[1990:] + footer)
+
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi soi WIP: `{str(e)[:300]}`")
+
+@bot.command(name="checkwippro")
+async def check_wip_pro(ctx, *, text: str = ""):
+    """Soi WIP chuyên sâu chi tiết (Hỗ trợ ảnh Discord & Link Drive >100MB)"""
+    has_attachment = bool(ctx.message.attachments)
+    has_drive = bool(extract_gdrive_id(text))
+    if not has_attachment and not has_drive:
+        await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP hoặc dán link Google Drive công khai cùng `!checkwippro`.")
+        return
+
+    attachment = ctx.message.attachments[0] if has_attachment else None
+    await ctx.send("🔍 Đang soi WIP chuyên sâu bằng Art Director AI...")
     async with ctx.typing():
         try:
-            image_bytes = await attachment.read()
-            image = await asyncio.to_thread(optimize_image, image_bytes)
-            
+            jpeg_bytes = await fetch_safe_image_bytes(attachment, text, max_size=1280, quality=85)
+            image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+
+            note = strip_gdrive_links(text)
+            extra_note = f"\nYêu cầu/Ghi chú từ Artist: {note}" if note else ""
+
             prompt_wip = (
-                "Phân tích WIP này chi tiết theo các hạng mục: "
-                "1. Layout & Composition (Bố cục) "
-                "2. Lighting & Contrast (Ánh sáng) "
-                "3. Color Grading (Màu sắc) "
-                "4. Các điểm lỗi cần fix ngay."
+                f"Phân tích WIP này chi tiết theo các hạng mục:{extra_note}\n"
+                "1. Layout & Composition (Bố cục & Điểm nhìn)\n"
+                "2. Lighting & Contrast (Ánh sáng & Tương phản)\n"
+                "3. Color Grading / Blending (Màu sắc & Hòa trộn)\n"
+                "4. Các điểm lỗi cần fix ngay và hướng dẫn xử lý kỹ thuật cụ thể."
             )
-            response = await async_safe_generate_content([prompt_wip, image])
+            response = await async_safe_generate_content([prompt_wip, image_part])
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
             await send_long_message(ctx, reply_text)
         except Exception as e:
