@@ -7,6 +7,7 @@ import json
 import string
 import urllib.request
 from datetime import datetime, timezone, timedelta
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 import discord
@@ -27,10 +28,11 @@ def now_vn():
     return datetime.now(VN_TZ).replace(tzinfo=None)
 
 # ==============================================================================
-# 2. CẤU HÌNH TOKEN & GEMINI API KEY (TỰ ĐỘNG LẤY TỪ RENDER ENVIRONMENT)
+# 2. CẤU HÌNH TOKEN & API KEYS (TỰ ĐỘNG LẤY TỪ RENDER ENVIRONMENT)
 # ==============================================================================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
 AI_MODEL_NAME = "gemini-3.8-flash"
@@ -154,7 +156,6 @@ async def async_safe_generate_content(arg1, arg2=None):
     if not GEMINI_API_KEY:
         raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
 
-    # Linh hoạt nhận 1 hoặc 2 tham số để không bao giờ bị lỗi gọi hàm
     contents = arg2 if arg2 is not None else arg1
 
     last_err = None
@@ -167,7 +168,7 @@ async def async_safe_generate_content(arg1, arg2=None):
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
                         temperature=0.7,
-                        max_output_tokens=800, # Giới hạn súc tích giúp trả lời siêu nhanh
+                        max_output_tokens=800,
                     )
                 ),
                 timeout=20.0
@@ -175,13 +176,23 @@ async def async_safe_generate_content(arg1, arg2=None):
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            # Nếu Google bận đột xuất 503, tự động chờ 1.5s rồi thử lại
             if ("503" in err_str or "unavailable" in err_str or "demand" in err_str) and attempt == 0:
                 await asyncio.sleep(1.5)
                 continue
             raise e
 
     raise last_err
+
+# Hàm dùng chung để gọi Apify Scraper
+async def run_apify_actor(actor_id: str, payload: dict):
+    if not APIFY_API_TOKEN:
+        raise Exception("Chưa cấu hình APIFY_API_TOKEN trong mục Environment của Render!")
+    endpoint = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items?token={APIFY_API_TOKEN}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if resp.status not in (200, 201):
+                raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
+            return await resp.json()
 
 # ==============================================================================
 # 7. SỰ KIỆN BOT & CÁC VÒNG LẶP CHẠY NGẦM
@@ -197,7 +208,6 @@ async def on_ready():
     if not keep_alive_ping.is_running():
         keep_alive_ping.start()
 
-# Tự động ping chính mình mỗi 5 phút để Render KHÔNG BAO GIỜ bị ngủ đông
 @tasks.loop(minutes=5)
 async def keep_alive_ping():
     def _ping():
@@ -299,7 +309,7 @@ async def before_loops():
 async def show_help(ctx):
     embed = discord.Embed(
         title="🎬 CẨM NANG BOT PRODUCTION HOUSE (SIÊU TỐC)",
-        description="Hệ thống quản lý tiến độ, lịch họp và trợ lý Gemini 3.8 Flash AI.",
+        description="Hệ thống quản lý tiến độ, lịch họp, soi Social Media & trợ lý Gemini 3.8 Flash AI.",
         color=discord.Color.gold()
     )
     embed.add_field(
@@ -335,7 +345,17 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="📁 4. Quản lý File & Link Dự án",
+        name="🌐 4. Soi Trend & Đối thủ (TikTok / FB / IG / X)",
+        value=(
+            "• `!soitiktok [link]` — Kéo thông số video TikTok & AI phân tích Hook/Visual\n"
+            "• `!soifb [link]` — Soi bài viết Facebook & đánh giá tương tác/nội dung\n"
+            "• `!soiig [link]` — Soi bài đăng/Reels Instagram & gợi ý góc làm Visual\n"
+            "• `!soix [link]` — Soi bài đăng X (Twitter) & phân tích insight"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📁 5. Quản lý File & Link Dự án",
         value=(
             "• `!nopfile [Tên dự án]` (Kèm file hoặc link) — Lưu trữ bản nộp vào hệ thống\n"
             "• `!tonghoplink [số tin nhắn]` — Quét và gom toàn bộ link Google Drive/Docs trong kênh"
@@ -487,7 +507,11 @@ async def check_api(ctx):
     try:
         res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"])
         elapsed = round((datetime.now() - start_t).total_seconds(), 2)
-        await ctx.send(f"⚡ **Tốc độ phản hồi AI:** `{elapsed} giây` | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n✅ **Hệ thống đang hoạt động siêu tốc!**")
+        apify_status = "✅ Đã gắn" if APIFY_API_TOKEN else "⚠️ Chưa gắn"
+        await ctx.send(
+            f"⚡ **Tốc độ phản hồi AI:** `{elapsed} giây` | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n"
+            f"🔑 **Apify Token:** {apify_status}"
+        )
     except Exception as e:
         await ctx.send(f"❌ **Lỗi kiểm tra AI:** `{str(e)[:250]}`")
 
@@ -504,7 +528,6 @@ async def ask_ai(ctx, *, prompt: str = None):
             
             history = USER_CHATS[ctx.author.id]
             full_context = ""
-            # Lưu 3 câu gần nhất để bốc dữ liệu nhanh nhất có thể
             for h in history[-3:]:
                 full_context += f"User: {h['user']}\nAssistant: {h['assistant']}\n"
             
@@ -615,7 +638,124 @@ async def aggregate_links(ctx, limit: int = 100):
     await send_long_message(ctx, msg)
 
 # ==============================================================================
-# 12. CỔNG MẠNG VÀ CHỐNG NGỦ ĐÔNG CHO RENDER
+# 12. CÁC LỆNH SOI SOCIAL MEDIA QUA APIFY (TIKTOK / FB / IG / X)
+# ==============================================================================
+@bot.command(name="soitiktok")
+async def soi_tiktok(ctx, url: str):
+    """Soi video TikTok: !soitiktok [link]"""
+    await ctx.send("🔍 Đang kéo dữ liệu TikTok và phân tích...")
+    async with ctx.typing():
+        try:
+            data = await run_apify_actor("clockworks~tiktok-scraper", {"postURLs": [url], "resultsPerPage": 1})
+            if not data:
+                await ctx.send("⚠️ Không lấy được dữ liệu (video có thể đang để riêng tư).")
+                return
+
+            v = data[0]
+            stats = (
+                f"• **Kênh:** {v.get('authorMeta', {}).get('name', 'N/A')}\n"
+                f"• **Caption:** {v.get('text', 'N/A')}\n"
+                f"• **Chỉ số:** {v.get('playCount', 0):,} views | {v.get('diggCount', 0):,} tim | "
+                f"{v.get('commentCount', 0):,} cmt | {v.get('shareCount', 0):,} share\n"
+                f"• **Thời lượng:** {v.get('videoMeta', {}).get('duration', 0)} giây"
+            )
+            prompt = (
+                f"Thông số video TikTok tham khảo cho Invisible Space Studio:\n{stats}\n\n"
+                "Phân tích ngắn gọn theo góc nhìn Creative/Art Director:\n"
+                "1. Đánh giá hiệu quả tương tác.\n"
+                "2. Dự đoán Hook & Mood chính.\n"
+                "3. Gợi ý 1 hướng chuyển hóa sang Visual/TVC cho Studio."
+            )
+            ai_res = await async_safe_generate_content([prompt])
+            await send_long_message(ctx, f"🎵 **THÔNG SỐ TIKTOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi soi TikTok: `{str(e)[:250]}`")
+
+@bot.command(name="soifb")
+async def soi_fb(ctx, url: str):
+    """Soi bài viết Facebook: !soifb [link]"""
+    await ctx.send("🔍 Đang kéo dữ liệu Facebook và phân tích...")
+    async with ctx.typing():
+        try:
+            data = await run_apify_actor("apify~facebook-posts-scraper", {"startUrls": [{"url": url}], "resultsLimit": 1})
+            if not data:
+                await ctx.send("⚠️ Không lấy được dữ liệu (bài viết cần để chế độ Công khai).")
+                return
+
+            p = data[0]
+            text_content = (p.get("text") or "N/A")[:400]
+            stats = (
+                f"• **Page/Tác giả:** {p.get('pageName') or p.get('user', {}).get('name', 'N/A')}\n"
+                f"• **Nội dung:** {text_content}\n"
+                f"• **Chỉ số:** {p.get('likes', 0):,} likes | {p.get('comments', 0):,} cmt | {p.get('shares', 0):,} share"
+            )
+            prompt = (
+                f"Thông số bài viết Facebook tham khảo cho Invisible Space Studio:\n{stats}\n\n"
+                "Phân tích ngắn gọn: Điểm mạnh của góc tiếp cận/copywriting, đánh giá tương tác và gợi ý cách áp dụng cho bài đăng của Studio."
+            )
+            ai_res = await async_safe_generate_content([prompt])
+            await send_long_message(ctx, f"📘 **THÔNG SỐ FACEBOOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi soi Facebook: `{str(e)[:250]}`")
+
+@bot.command(name="soiig")
+async def soi_ig(ctx, url: str):
+    """Soi bài đăng / Reels Instagram: !soiig [link]"""
+    await ctx.send("🔍 Đang kéo dữ liệu Instagram và phân tích...")
+    async with ctx.typing():
+        try:
+            data = await run_apify_actor("apify~instagram-scraper", {"directUrls": [url], "resultsLimit": 1})
+            if not data:
+                await ctx.send("⚠️ Không lấy được dữ liệu (tài khoản cần ở chế độ Công khai).")
+                return
+
+            p = data[0]
+            caption = (p.get("caption") or "N/A")[:400]
+            stats = (
+                f"• **Tài khoản:** @{p.get('ownerUsername', 'N/A')}\n"
+                f"• **Loại:** {p.get('type', 'Post')}\n"
+                f"• **Caption:** {caption}\n"
+                f"• **Chỉ số:** {p.get('likesCount', 0):,} likes | {p.get('commentsCount', 0):,} cmt | {p.get('videoViewCount', 0):,} views"
+            )
+            prompt = (
+                f"Thông số bài Instagram tham khảo cho Invisible Space Studio:\n{stats}\n\n"
+                "Phân tích ngắn gọn dưới góc nhìn Art Director: Cách dẫn dắt nội dung, mức độ hiệu quả và 1 gợi ý làm Visual/Reels tương tự."
+            )
+            ai_res = await async_safe_generate_content([prompt])
+            await send_long_message(ctx, f"📸 **THÔNG SỐ INSTAGRAM:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi soi Instagram: `{str(e)[:250]}`")
+
+@bot.command(name="soix")
+async def soi_x(ctx, url: str):
+    """Soi bài đăng X (Twitter): !soix [link]"""
+    await ctx.send("🔍 Đang kéo dữ liệu X (Twitter) và phân tích...")
+    async with ctx.typing():
+        try:
+            data = await run_apify_actor("apidojo~tweet-scraper", {"startUrls": [url], "maxItems": 1})
+            if not data:
+                await ctx.send("⚠️ Không lấy được dữ liệu bài đăng X này.")
+                return
+
+            t = data[0]
+            author = t.get("author", {}).get("userName") or t.get("user", {}).get("screen_name", "N/A")
+            stats = (
+                f"• **Tác giả:** @{author}\n"
+                f"• **Nội dung:** {(t.get('text') or t.get('fullText') or 'N/A')[:400]}\n"
+                f"• **Chỉ số:** {t.get('likeCount', 0):,} likes | {t.get('retweetCount', 0):,} RT | "
+                f"{t.get('replyCount', 0):,} reply | {t.get('viewCount', 0):,} views"
+            )
+            prompt = (
+                f"Thông số bài đăng X (Twitter) tham khảo cho Invisible Space Studio:\n{stats}\n\n"
+                "Phân tích ngắn gọn: Tại sao bài này thu hút (hoặc chưa thu hút), insight chính và gợi ý ứng dụng cho kênh truyền thông/portfolio quốc tế của Studio."
+            )
+            ai_res = await async_safe_generate_content([prompt])
+            await send_long_message(ctx, f"🐦 **THÔNG SỐ X (TWITTER):**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi soi X: `{str(e)[:250]}`")
+
+# ==============================================================================
+# 13. CỔNG MẠNG VÀ CHỐNG NGỦ ĐÔNG CHO RENDER
 # ==============================================================================
 async def handle_ping(request):
     return web.Response(text="Bot is running fast 24/7!")
