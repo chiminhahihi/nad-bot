@@ -365,7 +365,7 @@ async def run_apify_actor(actor_id: str, payload: dict):
                 raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
             return await resp.json()
 
-# Nút bấm "Soi sâu hơn" gắn ngay dưới kết quả !wip (không cần nhớ thêm lệnh pro)
+# Nút bấm "Soi sâu hơn" gắn ngay dưới kết quả !wip
 class DeepWipView(discord.ui.View):
     def __init__(self, attachment, text: str):
         super().__init__(timeout=300)
@@ -520,7 +520,7 @@ async def before_loops():
     await bot.wait_until_ready()
 
 # ==============================================================================
-# 8. LỆNH HƯỚNG DẪN (!huongdan / !help) — GỌN SẠCH, KHÔNG DẤU NGOẶC RƯỜM RÀ
+# 8. LỆNH HƯỚNG DẪN (!huongdan / !help)
 # ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
@@ -839,7 +839,6 @@ async def check_wip(ctx, *, text: str = ""):
         )
 
         full_text = ""
-        used_model = ""
         errors = []
 
         for model_name in FAST_WIP_MODELS:
@@ -880,7 +879,6 @@ async def check_wip(ctx, *, text: str = ""):
                     else:
                         raise te
 
-                used_model = model_name
                 last_edit = time.monotonic()
 
                 async for chunk in stream:
@@ -907,7 +905,7 @@ async def check_wip(ctx, *, text: str = ""):
             raise Exception(" | ".join(errors) or "Không nhận được phản hồi từ AI.")
 
         elapsed = round(time.monotonic() - start_t, 2)
-        footer = f"\n\n*⚡ `{used_model}` • `{elapsed}s`*"
+        footer = f"\n\n*⚡ `{elapsed}s`*"
         view = DeepWipView(attachment, text)
 
         if len(full_text) + len(footer) <= 2000:
