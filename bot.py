@@ -40,7 +40,7 @@ APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://nad-bot.onrender.com").strip()
 DATA_FILE = "production_data.json"
 
-MAX_RAW_DOWNLOAD_MB = 25   # Ngưỡng an toàn bảo vệ 512MB RAM của Render Free
+MAX_RAW_DOWNLOAD_MB = 25     # Ngưỡng an toàn bảo vệ 512MB RAM của Render Free
 MAX_RAW_PIXELS = 45_000_000  # Chặn bung pixel >45MP với PNG/TIFF tránh sập RAM
 
 FALLBACK_MODELS = [
@@ -144,7 +144,6 @@ def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 1024, quality: in
     """Nén ảnh sang JPEG nhẹ an toàn, chống tràn RAM khi gặp file độ phân giải cực lớn"""
     with Image.open(io.BytesIO(image_bytes)) as img:
         if img.format == "JPEG":
-            # Giải mã JPEG ở tỷ lệ thu nhỏ ngay từ tầng libjpeg để tiết kiệm RAM
             img.draft("RGB", (max_size, max_size))
         elif (img.width * img.height) > MAX_RAW_PIXELS:
             raise Exception(
@@ -167,7 +166,6 @@ async def fetch_safe_image_bytes(
 ) -> bytes:
     """Ưu tiên kéo ảnh đã nén từ CDN Discord hoặc Google Drive Thumbnail — chống tràn RAM 100%"""
     async with aiohttp.ClientSession() as session:
-        # 1. Nếu có link Google Drive (hỗ trợ cả PNG/TIFF/PSD >100MB mà không tải file gốc)
         drive_id = extract_gdrive_id(text)
         if drive_id and not attachment:
             thumb_url = f"https://drive.google.com/thumbnail?id={drive_id}&sz=w{max_size}"
@@ -184,7 +182,6 @@ async def fetch_safe_image_bytes(
                 "và đảm bảo đó là link file ảnh/PSD (không phải link thư mục)."
             )
 
-        # 2. Nếu có ảnh đính kèm Discord: ép Discord CDN tự resize + chuyển JPEG trước
         if attachment:
             sep = "&" if "?" in attachment.proxy_url else "?"
             fast_url = f"{attachment.proxy_url}{sep}format=jpeg&width={max_size}&height={max_size}"
@@ -203,7 +200,6 @@ async def fetch_safe_image_bytes(
             except Exception:
                 pass
 
-            # 3. Chốt chặn an toàn nếu Discord không tạo được proxy (file quá nặng / sai định dạng)
             size_mb = attachment.size / (1024 * 1024)
             if size_mb > MAX_RAW_DOWNLOAD_MB:
                 raise Exception(
@@ -267,11 +263,9 @@ class AIResponseWrapper:
         self.model_used = model_used
 
 def is_openrouter_model(model_name: str) -> bool:
-    """Model OpenRouter có dạng 'hang/ten-model' (không bắt đầu bằng 'models/')"""
     return "/" in model_name and not model_name.startswith("models/")
 
 async def call_single_model(model_name: str, contents):
-    """Gọi đích danh 1 model (tự nhận diện Google Gemini hoặc OpenRouter)"""
     if is_openrouter_model(model_name):
         if not OPENROUTER_API_KEY:
             raise Exception("Model dạng 'hãng/tên-model' cần gắn OPENROUTER_API_KEY trên Render!")
@@ -370,6 +364,52 @@ async def run_apify_actor(actor_id: str, payload: dict):
             if resp.status not in (200, 201):
                 raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
             return await resp.json()
+
+# Nút bấm "Soi sâu hơn" gắn ngay dưới kết quả !wip (không cần nhớ thêm lệnh pro)
+class DeepWipView(discord.ui.View):
+    def __init__(self, attachment, text: str):
+        super().__init__(timeout=300)
+        self.attachment = attachment
+        self.text = text
+
+    @discord.ui.button(label="🔍 Soi sâu hơn", style=discord.ButtonStyle.secondary)
+    async def deep_check(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if ALLOWED_USER_IDS and interaction.user.id not in ALLOWED_USER_IDS:
+            await interaction.response.send_message("⛔ Bạn không có quyền dùng nút này.", ephemeral=True)
+            return
+
+        button.disabled = True
+        button.label = "⏳ Đang soi sâu..."
+        await interaction.response.edit_message(view=self)
+
+        try:
+            jpeg_bytes = await fetch_safe_image_bytes(self.attachment, self.text, max_size=1280, quality=85)
+            image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+
+            note = strip_gdrive_links(self.text)
+            extra_note = f"\nYêu cầu/Ghi chú từ Artist: {note}" if note else ""
+
+            prompt_wip = (
+                f"Phân tích WIP này chuyên sâu theo các hạng mục:{extra_note}\n"
+                "1. Layout & Composition (Bố cục & Điểm nhìn)\n"
+                "2. Lighting & Contrast (Ánh sáng & Tương phản)\n"
+                "3. Color Grading / Blending (Màu sắc & Hòa trộn)\n"
+                "4. Các điểm lỗi cần fix ngay và hướng dẫn xử lý kỹ thuật cụ thể."
+            )
+            response = await async_safe_generate_content([prompt_wip, image_part])
+            reply_text = response.text if response and response.text else "Lỗi phản hồi."
+
+            button.label = "✅ Đã soi sâu"
+            await interaction.message.edit(view=self)
+            await send_long_message(interaction.channel, f"🔎 **PHÂN TÍCH CHUYÊN SÂU:**\n{reply_text}")
+        except Exception as e:
+            button.disabled = False
+            button.label = "🔍 Soi sâu hơn"
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+            await interaction.channel.send(f"❌ Lỗi soi sâu: `{str(e)[:300]}`")
 
 # ==============================================================================
 # 7. SỰ KIỆN BOT & CÁC VÒNG LẶP CHẠY NGẦM
@@ -480,7 +520,7 @@ async def before_loops():
     await bot.wait_until_ready()
 
 # ==============================================================================
-# 8. LỆNH HƯỚNG DẪN (!huongdan / !help)
+# 8. LỆNH HƯỚNG DẪN (!huongdan / !help) — GỌN SẠCH, KHÔNG DẤU NGOẶC RƯỜM RÀ
 # ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
@@ -491,45 +531,44 @@ async def show_help(ctx):
         color=discord.Color.gold()
     )
     embed.add_field(
-        name="📋 1. Quản lý Task & Deadline",
+        name="📋 1. Task & Deadline",
         value=(
-            "• `!task [Tên task] [Giờ] [Ngày]` — Tạo task & mở Thread riêng\n"
-            "• Nhắn `done` hoặc `xong` — Tự động báo hoàn thành task\n"
-            "• `!danhsachtask` | `!hoanthanh [số]` | `!xoatask [số]`"
+            "• `!task Key Visual 18:00 28/10` — Tạo task & mở Thread\n"
+            "• Nhắn `done` hoặc `xong` — Tự động báo hoàn thành\n"
+            "• `!danhsachtask` | `!hoanthanh 0` | `!xoatask 0`"
         ),
         inline=False
     )
     embed.add_field(
-        name="📅 2. Quản lý Lịch họp",
+        name="📅 2. Lịch họp",
         value=(
-            "• `!hop [Giờ] [Ngày] [Nội dung]` — Họp chung (@everyone)\n"
-            "• `!hoprieng [@User] [Giờ] [Ngày] [Nội dung]` — Họp riêng\n"
+            "• `!hop 20:30 26/10 Duyệt concept` — Họp chung (@everyone)\n"
+            "• `!hoprieng @User 20:30 26/10 Duyệt bài` — Họp riêng\n"
             "• `!danhsachhop` — Xem lịch họp sắp tới"
         ),
         inline=False
     )
     embed.add_field(
-        name="🧠 3. Trợ lý AI & Duyệt WIP (Hỗ trợ ảnh & Link Drive >100MB)",
+        name="🧠 3. AI & Duyệt WIP",
         value=(
-            "• `!ai [câu hỏi / link Drive]` — Hỏi đáp AI Art Director (kèm ảnh hoặc link Drive)\n"
-            "• `!checkwip [link Drive / ghi chú]` (Hoặc đính kèm ảnh) — Soi WIP **siêu tốc** (chạy chữ live)\n"
-            "• `!checkwippro [link Drive / ghi chú]` (Hoặc đính kèm ảnh) — Soi WIP chuyên sâu chi tiết\n"
-            "• `!taoprompt [ý tưởng]` | `!datten [tên file]` | `!resetai`\n"
-            "• `!listmodel` | `!setmodel [model_id / auto]` | `!checkapi`"
+            "• `!wip` (hoặc `!checkwip`) — Thả ảnh hoặc dán link Drive để soi siêu tốc, cần soi kỹ bấm nút ngay dưới bài\n"
+            "• `!ai câu hỏi` — Hỏi đáp AI (kèm ảnh hoặc link Drive được)\n"
+            "• `!taoprompt ý tưởng` | `!datten tên file` | `!resetai`\n"
+            "• `!listmodel` | `!setmodel tên_model` | `!checkapi`"
         ),
         inline=False
     )
     embed.add_field(
-        name="🌐 4. Soi Trend & Đối thủ (TikTok / FB / IG / X)",
+        name="🌐 4. Soi Social Media",
         value=(
-            "• `!soitiktok [link]` | `!soifb [link]` | `!soiig [link]` | `!soix [link]`"
+            "• `!soitiktok link` | `!soifb link` | `!soiig link` | `!soix link`"
         ),
         inline=False
     )
     embed.add_field(
-        name="📁 5. Quản lý File & Link Dự án",
+        name="📁 5. File & Link Dự án",
         value=(
-            "• `!nopfile [Tên dự án]` (Kèm file/link) | `!tonghoplink [số tin nhắn]`"
+            "• `!nopfile Tên dự án` (kèm file/link) | `!tonghoplink`"
         ),
         inline=False
     )
@@ -673,7 +712,6 @@ async def list_meetings(ctx):
 # ==============================================================================
 @bot.command(name="listmodel")
 async def list_models(ctx):
-    """Liệt kê toàn bộ mã Model ID thật mà GEMINI_API_KEY đang được dùng"""
     async with ctx.typing():
         try:
             def _fetch():
@@ -682,18 +720,17 @@ async def list_models(ctx):
             await send_long_message(
                 ctx,
                 "📋 **Các Model khả dụng trên Gemini Key của bạn:**\n`" + "`\n`".join(models) + "`\n\n"
-                "👉 Dùng `!setmodel [tên_model]` để chuyển ngay (hoặc nhập mã OpenRouter dạng `hãng/tên-model`)."
+                "👉 Dùng `!setmodel tên_model` để chuyển ngay (hoặc nhập mã OpenRouter dạng `hãng/tên-model`)."
             )
         except Exception as e:
             await ctx.send(f"❌ Lỗi lấy danh sách model: `{str(e)[:250]}`")
 
 @bot.command(name="setmodel")
 async def set_model(ctx, model_id: str = None):
-    """Đổi model AI đang sử dụng (tự kiểm tra trước khi lưu): !setmodel [model_id / auto]"""
     global ACTIVE_MODEL
     if not model_id:
         current = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({', '.join(FALLBACK_MODELS)})"
-        await ctx.send(f"ℹ️ Model hiện tại: **`{current}`**\nDùng `!setmodel [model_id]` để đổi hoặc `!setmodel auto` để tự động.")
+        await ctx.send(f"ℹ️ Model hiện tại: **`{current}`**\nDùng `!setmodel tên_model` để đổi hoặc `!setmodel auto` để tự động.")
         return
 
     if model_id.lower() == "auto":
@@ -718,7 +755,6 @@ async def set_model(ctx, model_id: str = None):
 
 @bot.command(name="checkapi")
 async def check_api(ctx):
-    """Kiểm tra tốc độ phản hồi thực tế của AI và trạng thái các Key"""
     start_t = datetime.now()
     try:
         res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"])
@@ -771,13 +807,13 @@ async def ask_ai(ctx, *, prompt: str = None):
         except Exception as e:
             await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
 
-@bot.command(name="checkwip")
+@bot.command(name="wip", aliases=["checkwip"])
 async def check_wip(ctx, *, text: str = ""):
-    """Soi WIP siêu tốc (Hỗ trợ ảnh Discord & Link Drive >100MB, chạy chữ live)"""
+    """Soi WIP gọn trong 1 lệnh (!wip hoặc !checkwip), có nút bấm Soi sâu hơn ngay dưới kết quả"""
     has_attachment = bool(ctx.message.attachments)
     has_drive = bool(extract_gdrive_id(text))
     if not has_attachment and not has_drive:
-        await ctx.send("⚠️ Đính kèm ảnh WIP hoặc dán link Google Drive công khai cùng lệnh `!checkwip`.")
+        await ctx.send("⚠️ Thả ảnh WIP hoặc dán link Google Drive công khai kèm lệnh `!wip`.")
         return
     if not GEMINI_API_KEY:
         await ctx.send("❌ Chưa cấu hình `GEMINI_API_KEY` trong mục Environment của Render!")
@@ -872,46 +908,17 @@ async def check_wip(ctx, *, text: str = ""):
 
         elapsed = round(time.monotonic() - start_t, 2)
         footer = f"\n\n*⚡ `{used_model}` • `{elapsed}s`*"
+        view = DeepWipView(attachment, text)
+
         if len(full_text) + len(footer) <= 2000:
-            await status_msg.edit(content=full_text + footer)
+            await status_msg.edit(content=full_text + footer, view=view)
         else:
             await status_msg.edit(content=full_text[:1990])
             await send_long_message(ctx, full_text[1990:] + footer)
+            await ctx.send("Bấm bên dưới nếu cần phân tích chi tiết hơn:", view=view)
 
     except Exception as e:
         await status_msg.edit(content=f"❌ Lỗi soi WIP: `{str(e)[:300]}`")
-
-@bot.command(name="checkwippro")
-async def check_wip_pro(ctx, *, text: str = ""):
-    """Soi WIP chuyên sâu chi tiết (Hỗ trợ ảnh Discord & Link Drive >100MB)"""
-    has_attachment = bool(ctx.message.attachments)
-    has_drive = bool(extract_gdrive_id(text))
-    if not has_attachment and not has_drive:
-        await ctx.send("⚠️ Vui lòng đính kèm ảnh WIP hoặc dán link Google Drive công khai cùng `!checkwippro`.")
-        return
-
-    attachment = ctx.message.attachments[0] if has_attachment else None
-    await ctx.send("🔍 Đang soi WIP chuyên sâu bằng Art Director AI...")
-    async with ctx.typing():
-        try:
-            jpeg_bytes = await fetch_safe_image_bytes(attachment, text, max_size=1280, quality=85)
-            image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
-
-            note = strip_gdrive_links(text)
-            extra_note = f"\nYêu cầu/Ghi chú từ Artist: {note}" if note else ""
-
-            prompt_wip = (
-                f"Phân tích WIP này chi tiết theo các hạng mục:{extra_note}\n"
-                "1. Layout & Composition (Bố cục & Điểm nhìn)\n"
-                "2. Lighting & Contrast (Ánh sáng & Tương phản)\n"
-                "3. Color Grading / Blending (Màu sắc & Hòa trộn)\n"
-                "4. Các điểm lỗi cần fix ngay và hướng dẫn xử lý kỹ thuật cụ thể."
-            )
-            response = await async_safe_generate_content([prompt_wip, image_part])
-            reply_text = response.text if response and response.text else "Lỗi phản hồi."
-            await send_long_message(ctx, reply_text)
-        except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
@@ -978,7 +985,6 @@ async def aggregate_links(ctx, limit: int = 100):
 # ==============================================================================
 @bot.command(name="soitiktok")
 async def soi_tiktok(ctx, url: str):
-    """Soi video TikTok: !soitiktok [link]"""
     await ctx.send("🔍 Đang kéo dữ liệu TikTok và phân tích...")
     async with ctx.typing():
         try:
@@ -1009,7 +1015,6 @@ async def soi_tiktok(ctx, url: str):
 
 @bot.command(name="soifb")
 async def soi_fb(ctx, url: str):
-    """Soi bài viết Facebook: !soifb [link]"""
     await ctx.send("🔍 Đang kéo dữ liệu Facebook và phân tích...")
     async with ctx.typing():
         try:
@@ -1036,7 +1041,6 @@ async def soi_fb(ctx, url: str):
 
 @bot.command(name="soiig")
 async def soi_ig(ctx, url: str):
-    """Soi bài đăng / Reels Instagram: !soiig [link]"""
     await ctx.send("🔍 Đang kéo dữ liệu Instagram và phân tích...")
     async with ctx.typing():
         try:
@@ -1064,7 +1068,6 @@ async def soi_ig(ctx, url: str):
 
 @bot.command(name="soix")
 async def soi_x(ctx, url: str):
-    """Soi bài đăng X (Twitter): !soix [link]"""
     await ctx.send("🔍 Đang kéo dữ liệu X (Twitter) và phân tích...")
     async with ctx.typing():
         try:
