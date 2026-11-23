@@ -20,4 +20,4 @@ By inviting or using **[Tên Bot]** ("the Bot") on your Discord server, you agre
 - We reserve the right to restrict or ban any user or server from using the Bot if they violate these terms or attempt to exploit the system.
 
 ## 5. Contact
-If you have any questions regarding these Terms of Service, please contact us via Discord at **[Username Discord của bạn]** or email **[Email của bạn]**.
+If you have any questions regarding these Terms of Service, please contact us via Discord at **[Chiminhahihi]** or email **[phanchiminh263@gmail.com]**.
