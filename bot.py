@@ -494,7 +494,6 @@ class MeetingRoomView(discord.ui.View):
         member = interaction.user
         room_name = f"{MEETING_PREFIX}{member.display_name}"[:95]
 
-        # Nếu người này đã có sẵn phòng đang mở thì dẫn tới phòng đó luôn
         existing = discord.utils.get(guild.voice_channels, name=room_name)
         if existing:
             await interaction.response.send_message(
@@ -536,6 +535,11 @@ async def on_ready():
         bot.add_view(RoleSelectView())
         bot.add_view(MeetingRoomView())
         VIEWS_REGISTERED = True
+        try:
+            await bot.tree.sync()
+            print("[SYSTEM] Đã đồng bộ Slash Command lên Discord.")
+        except Exception as e:
+            print(f"[SYSTEM] Lỗi đồng bộ Slash Command: {e}")
 
     print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
     print(f"[SYSTEM] Model ưu tiên: {ACTIVE_MODEL or 'Auto'} | Dự phòng: {', '.join(FALLBACK_MODELS)}")
@@ -654,7 +658,7 @@ async def before_loops():
     await bot.wait_until_ready()
 
 # ==============================================================================
-# 8. LỆNH HƯỚNG DẪN (!huongdan / !help)
+# 8. LỆNH HƯỚNG DẪN (!huongdan / !help & Slash /huongdan)
 # ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
@@ -711,6 +715,13 @@ async def show_help(ctx):
     )
     embed.set_footer(text=f"Múi giờ: UTC+7 ({now_vn().strftime('%H:%M - %d/%m/%Y')})")
     await ctx.send(embed=embed)
+
+@bot.tree.command(name="huongdan", description="Xem danh sách lệnh của NAD Prism")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "🎬 **NAD Prism** đã sẵn sàng! Gõ `!huongdan` trong kênh chat để mở đầy đủ bảng lệnh (`!wip`, `!tomtat`, `!task`, `!hop`, `!setuproles`, `!setuphop`).",
+        ephemeral=True
+    )
 
 # ==============================================================================
 # 8.5. CÁC LỆNH QUẢN LÝ SERVER (BẢNG ROLE & NÚT TẠO PHÒNG HỌP)
