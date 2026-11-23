@@ -44,18 +44,22 @@ MAX_RAW_DOWNLOAD_MB = 25     # Ngưỡng an toàn bảo vệ 512MB RAM của Ren
 MAX_RAW_PIXELS = 45_000_000  # Chặn bung pixel >45MP với PNG/TIFF tránh sập RAM
 
 FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
 ]
 
 FAST_WIP_MODELS = [
     "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
     "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
 ]
 
-# Danh sách các Role cho bảng nút bấm !setuproles (bạn có thể đổi tên trực tiếp tại đây)
+# Danh sách các Role cho bảng nút bấm !setuproles
 STUDIO_ROLES = [
     {"id": "role_art_director", "name": "Art Director", "emoji": "🎨"},
     {"id": "role_visual_artist", "name": "Visual Artist", "emoji": "🎬"},
@@ -67,6 +71,16 @@ STUDIO_ROLES = [
 MEETING_PREFIX = "🎙️ Họp - "
 
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
+HTTP_SESSION = None
+CACHED_FAST_MODEL = ""  # Tự ghim model chạy nhanh & ổn định nhất để bỏ qua độ trễ fallback
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        HTTP_SESSION = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
+        )
+    return HTTP_SESSION
 
 # ==============================================================================
 # 3. LƯU TRỮ DỮ LIỆU
@@ -129,13 +143,13 @@ async def globally_block_unauthorized(ctx):
     return True
 
 SYSTEM_PROMPT = (
-    "Bạn là chuyên gia Production House, hội tụ tư duy của Art Director, Creative Director, Producer, DI Artist và Visual Artist. "
-    "Giao tiếp: cực kỳ nhanh gọn, thẳng thắn, xúc tích, chuyên nghiệp, không dài dòng giải thích sáo rỗng. "
-    "Khi duyệt file/WIP: soi chi tiết bố cục, ánh sáng, màu sắc (DI) và đưa giải pháp thực tế ngay lập tức."
+    "Bạn là chuyên gia Production House (Art Director, Creative Director, Producer, DI Artist). "
+    "Trả lời cực kỳ nhanh gọn, thẳng vào vấn đề, súc tích, không rào đón. "
+    "Khi duyệt WIP: chỉ thẳng lỗi bố cục, ánh sáng, màu (DI) và cách fix ngắn gọn nhất."
 )
 
 # ==============================================================================
-# 5. TIỆN ÍCH, XỬ LÝ ẢNH CHỐNG TRÀN RAM & HỖ TRỢ LINK GOOGLE DRIVE
+# 5. TIỆN ÍCH, XỬ LÝ ẢNH SIÊU TỐC CHỐNG TRÀN RAM & HỖ TRỢ LINK GOOGLE DRIVE
 # ==============================================================================
 async def send_long_message(destination, text: str):
     if not text:
@@ -156,7 +170,7 @@ def strip_gdrive_links(text: str) -> str:
     cleaned = re.sub(r'https?://drive\.google\.com/[^\s]+', '', text)
     return ' '.join(cleaned.split()).strip()
 
-def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 1024, quality: int = 80) -> bytes:
+def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 768, quality: int = 75) -> bytes:
     """Nén ảnh sang JPEG nhẹ an toàn, chống tràn RAM khi gặp file độ phân giải cực lớn"""
     with Image.open(io.BytesIO(image_bytes)) as img:
         if img.format == "JPEG":
@@ -177,59 +191,62 @@ def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 1024, quality: in
 async def fetch_safe_image_bytes(
     attachment: discord.Attachment = None,
     text: str = "",
-    max_size: int = 1024,
-    quality: int = 80
+    max_size: int = 512,
+    quality: int = 72
 ) -> bytes:
-    """Ưu tiên kéo ảnh đã nén từ CDN Discord hoặc Google Drive Thumbnail — chống tràn RAM 100%"""
-    async with aiohttp.ClientSession() as session:
-        drive_id = extract_gdrive_id(text)
-        if drive_id and not attachment:
-            thumb_url = f"https://drive.google.com/thumbnail?id={drive_id}&sz=w{max_size}"
-            async with session.get(thumb_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+    """Kéo ảnh JPEG đã nén sẵn từ CDN Discord/Google Drive — bỏ qua Pillow nếu đã đủ nhẹ để tiết kiệm 1s"""
+    session = await get_http_session()
+
+    drive_id = extract_gdrive_id(text)
+    if drive_id and not attachment:
+        thumb_url = f"https://drive.google.com/thumbnail?id={drive_id}&sz=w{max_size}"
+        async with session.get(thumb_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if resp.status == 200 and "image" in ctype:
+                raw = await resp.read()
+                if ("jpeg" in ctype or "jpg" in ctype) and len(raw) < 400_000:
+                    return raw
+                res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                del raw
+                return res
+        raise Exception(
+            "Không lấy được ảnh từ Google Drive. Hãy bật quyền 'Bất kỳ ai có đường liên kết' "
+            "và đảm bảo đó là link file ảnh/PSD."
+        )
+
+    if attachment:
+        sep = "&" if "?" in attachment.proxy_url else "?"
+        fast_url = f"{attachment.proxy_url}{sep}format=jpeg&width={max_size}&height={max_size}"
+        try:
+            async with session.get(fast_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                clen = int(resp.headers.get("Content-Length") or 0)
                 ctype = resp.headers.get("Content-Type", "").lower()
-                if resp.status == 200 and "image" in ctype:
+                if resp.status == 200 and "image" in ctype and clen < 5 * 1024 * 1024:
                     raw = await resp.read()
-                    res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                    # Nếu Discord CDN đã trả về JPEG nhẹ (<400KB), dùng thẳng không cần qua Pillow
+                    if ("jpeg" in ctype or "jpg" in ctype) and len(raw) < 400_000:
+                        return raw
+                    if len(raw) < 5 * 1024 * 1024:
+                        res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+                        del raw
+                        return res
                     del raw
-                    gc.collect()
-                    return res
+        except Exception:
+            pass
+
+        size_mb = attachment.size / (1024 * 1024)
+        if size_mb > MAX_RAW_DOWNLOAD_MB:
             raise Exception(
-                "Không lấy được ảnh từ Google Drive. Hãy bật quyền 'Bất kỳ ai có đường liên kết' "
-                "và đảm bảo đó là link file ảnh/PSD (không phải link thư mục)."
+                f"File nặng {size_mb:.1f}MB vượt ngưỡng an toàn RAM ({MAX_RAW_DOWNLOAD_MB}MB). "
+                "Hãy gửi bản JPEG preview nhẹ hoặc dán link Google Drive (công khai)."
             )
 
-        if attachment:
-            sep = "&" if "?" in attachment.proxy_url else "?"
-            fast_url = f"{attachment.proxy_url}{sep}format=jpeg&width={max_size}&height={max_size}"
-            try:
-                async with session.get(fast_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    clen = int(resp.headers.get("Content-Length") or 0)
-                    ctype = resp.headers.get("Content-Type", "").lower()
-                    if resp.status == 200 and "image" in ctype and clen < 10 * 1024 * 1024:
-                        raw = await resp.read()
-                        if len(raw) < 10 * 1024 * 1024:
-                            res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
-                            del raw
-                            gc.collect()
-                            return res
-                        del raw
-            except Exception:
-                pass
-
-            size_mb = attachment.size / (1024 * 1024)
-            if size_mb > MAX_RAW_DOWNLOAD_MB:
-                raise Exception(
-                    f"File nặng {size_mb:.1f}MB vượt ngưỡng an toàn RAM ({MAX_RAW_DOWNLOAD_MB}MB). "
-                    "Hãy xuất bản JPEG preview nhẹ hoặc gửi link Google Drive (công khai) để bot soi trực tiếp."
-                )
-
-            raw = await attachment.read()
-            try:
-                res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
-                return res
-            finally:
-                del raw
-                gc.collect()
+        raw = await attachment.read()
+        try:
+            return await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
+        finally:
+            del raw
+            gc.collect()
 
     raise Exception("Không tìm thấy ảnh đính kèm hoặc link Google Drive hợp lệ.")
 
@@ -271,7 +288,7 @@ def extract_topic(text):
     return ' '.join(text.split()).strip()
 
 # ==============================================================================
-# 6. HÀM GỌI ĐA NỀN TẢNG (GOOGLE GEMINI + OPENROUTER) & TỰ ĐỘNG FALLBACK
+# 6. HÀM GỌI AI SIÊU TỐC (TẮT THINKING, CACHE MODEL NHANH, STREAMING)
 # ==============================================================================
 class AIResponseWrapper:
     def __init__(self, text: str, model_used: str):
@@ -281,7 +298,20 @@ class AIResponseWrapper:
 def is_openrouter_model(model_name: str) -> bool:
     return "/" in model_name and not model_name.startswith("models/")
 
-async def call_single_model(model_name: str, contents):
+def build_gemini_config(max_tokens: int = 600, temperature: float = 0.6, disable_thinking: bool = True):
+    cfg_kwargs = {
+        "system_instruction": SYSTEM_PROMPT,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
+    if disable_thinking and hasattr(types, "ThinkingConfig"):
+        return types.GenerateContentConfig(
+            **cfg_kwargs,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
+    return types.GenerateContentConfig(**cfg_kwargs)
+
+async def call_single_model(model_name: str, contents, max_tokens: int = 800, temperature: float = 0.6):
     if is_openrouter_model(model_name):
         if not OPENROUTER_API_KEY:
             raise Exception("Model dạng 'hãng/tên-model' cần gắn OPENROUTER_API_KEY trên Render!")
@@ -293,93 +323,211 @@ async def call_single_model(model_name: str, contents):
                 user_parts.append({"type": "text", "text": item})
             elif isinstance(item, Image.Image):
                 buf = io.BytesIO()
-                item.save(buf, format="JPEG", quality=85)
+                item.save(buf, format="JPEG", quality=80)
                 b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                user_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-                })
+                user_parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             elif hasattr(item, "inline_data") and getattr(item.inline_data, "data", None):
                 mime = item.inline_data.mime_type or "image/jpeg"
                 b64 = base64.b64encode(item.inline_data.data).decode("utf-8")
-                user_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"}
-                })
+                user_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        session = await get_http_session()
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": model_name,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_parts}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 1500,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_parts}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=35)
-            ) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    err_msg = data.get("error", {}).get("message", str(data))
-                    raise Exception(f"OpenRouter {resp.status}: {err_msg}")
-                text = data["choices"][0]["message"]["content"]
-                return AIResponseWrapper(text=text, model_used=model_name)
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                err_msg = data.get("error", {}).get("message", str(data))
+                raise Exception(f"OpenRouter {resp.status}: {err_msg}")
+            return AIResponseWrapper(text=data["choices"][0]["message"]["content"], model_used=model_name)
     else:
         if not GEMINI_API_KEY:
             raise Exception("Chưa cấu hình GEMINI_API_KEY trong mục Environment của Render!")
-        res = await asyncio.wait_for(
-            client_ai.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0.7,
-                    max_output_tokens=1500,
+        try:
+            res = await asyncio.wait_for(
+                client_ai.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=build_gemini_config(max_tokens=max_tokens, temperature=temperature, disable_thinking=True)
+                ),
+                timeout=15.0
+            )
+        except Exception as te:
+            if any(k in str(te).lower() for k in ("thinking", "400", "invalid", "unsupported")):
+                res = await asyncio.wait_for(
+                    client_ai.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=build_gemini_config(max_tokens=max_tokens, temperature=temperature, disable_thinking=False)
+                    ),
+                    timeout=15.0
                 )
-            ),
-            timeout=35.0
-        )
+            else:
+                raise te
         return AIResponseWrapper(text=res.text, model_used=model_name)
 
-async def async_safe_generate_content(arg1, arg2=None):
+async def async_safe_generate_content(arg1, arg2=None, max_tokens: int = 800):
+    global CACHED_FAST_MODEL
     contents = arg2 if arg2 is not None else arg1
-    sequence = ([ACTIVE_MODEL] if ACTIVE_MODEL else []) + FALLBACK_MODELS
+    sequence = (
+        ([ACTIVE_MODEL] if ACTIVE_MODEL else [])
+        + ([CACHED_FAST_MODEL] if CACHED_FAST_MODEL else [])
+        + FALLBACK_MODELS
+    )
     models_to_try = list(dict.fromkeys(sequence))
 
     errors = []
     for model_name in models_to_try:
         try:
-            return await call_single_model(model_name, contents)
+            res = await call_single_model(model_name, contents, max_tokens=max_tokens)
+            if not ACTIVE_MODEL and not is_openrouter_model(model_name):
+                CACHED_FAST_MODEL = model_name
+            return res
         except asyncio.TimeoutError:
-            errors.append(f"{model_name}: Quá thời gian chờ (35s)")
+            if model_name == CACHED_FAST_MODEL:
+                CACHED_FAST_MODEL = ""
+            errors.append(f"{model_name}: Timeout")
             continue
         except Exception as e:
+            if model_name == CACHED_FAST_MODEL:
+                CACHED_FAST_MODEL = ""
             err_str = str(e).lower()
-            errors.append(f"{model_name}: {str(e)[:80]}")
-            if any(k in err_str for k in ("503", "unavailable", "demand", "404", "overloaded", "timeout", "429", "quota")):
+            errors.append(f"{model_name}: {str(e)[:70]}")
+            if any(k in err_str for k in ("503", "unavailable", "demand", "404", "overloaded", "timeout", "429", "quota", "not found")):
                 continue
             raise e
 
     raise Exception(" | ".join(errors))
 
+async def stream_fast_reply(
+    ctx,
+    status_msg,
+    contents,
+    start_t: float,
+    max_tokens: int = 350,
+    temperature: float = 0.5,
+    prefix: str = "",
+    show_timer: bool = False,
+    view=None,
+) -> str:
+    """Trả lời siêu tốc bằng Streaming (chữ chạy sau ~1s, xong trong 2-4s)"""
+    global CACHED_FAST_MODEL
+
+    # Nếu admin chọn đích danh OpenRouter thì gọi qua nhánh thường
+    if ACTIVE_MODEL and is_openrouter_model(ACTIVE_MODEL):
+        res = await call_single_model(ACTIVE_MODEL, contents, max_tokens=max_tokens, temperature=temperature)
+        elapsed = round(time.monotonic() - start_t, 2)
+        footer = f"\n\n*⚡ `{elapsed}s`*" if show_timer else ""
+        final_text = f"{prefix}{res.text}{footer}"
+        if len(final_text) <= 2000:
+            await status_msg.edit(content=final_text, view=view)
+        else:
+            await status_msg.edit(content=final_text[:1990])
+            await send_long_message(ctx, final_text[1990:])
+            if view:
+                await ctx.send("Tùy chọn thêm:", view=view)
+        return res.text
+
+    sequence = (
+        ([ACTIVE_MODEL] if ACTIVE_MODEL else [])
+        + ([CACHED_FAST_MODEL] if CACHED_FAST_MODEL else [])
+        + FAST_WIP_MODELS
+    )
+    models_to_try = list(dict.fromkeys(sequence))
+
+    full_text = ""
+    errors = []
+
+    for model_name in models_to_try:
+        try:
+            try:
+                stream = await asyncio.wait_for(
+                    client_ai.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=build_gemini_config(max_tokens=max_tokens, temperature=temperature, disable_thinking=True)
+                    ),
+                    timeout=8.0
+                )
+            except Exception as te:
+                if any(k in str(te).lower() for k in ("thinking", "400", "invalid", "unsupported")):
+                    stream = await asyncio.wait_for(
+                        client_ai.aio.models.generate_content_stream(
+                            model=model_name,
+                            contents=contents,
+                            config=build_gemini_config(max_tokens=max_tokens, temperature=temperature, disable_thinking=False)
+                        ),
+                        timeout=8.0
+                    )
+                else:
+                    raise te
+
+            last_edit = time.monotonic()
+            async for chunk in stream:
+                if chunk.text:
+                    full_text += chunk.text
+                    now_t = time.monotonic()
+                    if now_t - last_edit >= 0.45 and full_text.strip():
+                        try:
+                            preview = f"{prefix}{full_text}"
+                            await status_msg.edit(content=f"{preview[:1950]} ▌")
+                        except Exception:
+                            pass
+                        last_edit = now_t
+
+            if full_text.strip():
+                if not ACTIVE_MODEL:
+                    CACHED_FAST_MODEL = model_name
+                break
+        except asyncio.TimeoutError:
+            if model_name == CACHED_FAST_MODEL:
+                CACHED_FAST_MODEL = ""
+            errors.append(f"{model_name}: Timeout 8s")
+            full_text = ""
+            continue
+        except Exception as e:
+            if model_name == CACHED_FAST_MODEL:
+                CACHED_FAST_MODEL = ""
+            errors.append(f"{model_name}: {str(e)[:70]}")
+            full_text = ""
+            continue
+
+    if not full_text.strip():
+        raise Exception(" | ".join(errors) or "Không nhận được phản hồi từ AI.")
+
+    elapsed = round(time.monotonic() - start_t, 2)
+    footer = f"\n\n*⚡ `{elapsed}s`*" if show_timer else ""
+    final_text = f"{prefix}{full_text}{footer}"
+
+    if len(final_text) <= 2000:
+        await status_msg.edit(content=final_text, view=view)
+    else:
+        await status_msg.edit(content=final_text[:1990])
+        await send_long_message(ctx, final_text[1990:])
+        if view:
+            await ctx.send("Bấm bên dưới nếu cần phân tích chi tiết hơn:", view=view)
+
+    return full_text
+
 async def run_apify_actor(actor_id: str, payload: dict):
     if not APIFY_API_TOKEN:
         raise Exception("Chưa cấu hình APIFY_API_TOKEN trong mục Environment của Render!")
+    session = await get_http_session()
     endpoint = f"https://api.apify.com/v2/acts/{actor_id}/run-sync-get-dataset-items?token={APIFY_API_TOKEN}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status not in (200, 201):
-                raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
-            return await resp.json()
+    async with session.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        if resp.status not in (200, 201):
+            raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
+        return await resp.json()
 
 # ==============================================================================
 # 6.5. CÁC BẢNG NÚT BẤM TƯƠNG TÁC (WIP, NHẬN ROLE, TẠO PHÒNG HỌP)
@@ -401,7 +549,7 @@ class DeepWipView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
         try:
-            jpeg_bytes = await fetch_safe_image_bytes(self.attachment, self.text, max_size=1280, quality=85)
+            jpeg_bytes = await fetch_safe_image_bytes(self.attachment, self.text, max_size=1024, quality=82)
             image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
 
             note = strip_gdrive_links(self.text)
@@ -414,7 +562,7 @@ class DeepWipView(discord.ui.View):
                 "3. Color Grading / Blending (Màu sắc & Hòa trộn)\n"
                 "4. Các điểm lỗi cần fix ngay và hướng dẫn xử lý kỹ thuật cụ thể."
             )
-            response = await async_safe_generate_content([prompt_wip, image_part])
+            response = await async_safe_generate_content([prompt_wip, image_part], max_tokens=900)
             reply_text = response.text if response and response.text else "Lỗi phản hồi."
 
             button.label = "✅ Đã soi sâu"
@@ -469,7 +617,6 @@ class RoleSelectView(discord.ui.View):
             self.add_item(RoleButton(cfg))
 
 async def auto_delete_empty_meeting(channel: discord.VoiceChannel, delay: int = 120):
-    """Tự động xóa phòng họp nếu sau 2 phút vẫn không có ai vào"""
     await asyncio.sleep(delay)
     ch = bot.get_channel(channel.id)
     if ch and isinstance(ch, discord.VoiceChannel) and len(ch.members) == 0:
@@ -552,7 +699,6 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Tự động xóa phòng họp tạm ngay khi người cuối cùng thoát ra"""
     left_ch = before.channel
     if left_ch and left_ch != after.channel:
         is_temp = (left_ch.id in TEMP_VOICE_CHANNELS) or left_ch.name.startswith(MEETING_PREFIX)
@@ -662,7 +808,7 @@ async def before_loops():
 # ==============================================================================
 @bot.command(name="huongdan", aliases=["help", "lenh"])
 async def show_help(ctx):
-    current_m = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({FALLBACK_MODELS[0]})"
+    current_m = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({CACHED_FAST_MODEL or FALLBACK_MODELS[0]})"
     embed = discord.Embed(
         title="🎬 CẨM NANG BOT PRODUCTION HOUSE",
         description=f"Model đang chạy: **`{current_m}`**",
@@ -728,7 +874,6 @@ async def slash_help(interaction: discord.Interaction):
 # ==============================================================================
 @bot.command(name="setuproles")
 async def setup_roles(ctx):
-    """Gửi bảng nút bấm tự nhận/gỡ Role chuyên môn"""
     embed = discord.Embed(
         title="🎭 CHỌN BỘ PHẬN / ROLE CỦA BẠN",
         description=(
@@ -743,7 +888,6 @@ async def setup_roles(ctx):
 
 @bot.command(name="setuphop")
 async def setup_meeting_panel(ctx):
-    """Gửi bảng nút bấm tạo phòng họp thoại tạm thời"""
     embed = discord.Embed(
         title="🎙️ TẠO PHÒNG HỌP NHANH",
         description=(
@@ -888,7 +1032,7 @@ async def list_meetings(ctx):
     await send_long_message(ctx, msg)
 
 # ==============================================================================
-# 11. CÁC LỆNH AI, QUẢN LÝ MODEL & TÓM TẮT KÊNH
+# 11. CÁC LỆNH AI, QUẢN LÝ MODEL & TÓM TẮT KÊNH (TỐI ƯU < 3-4S)
 # ==============================================================================
 @bot.command(name="listmodel")
 async def list_models(ctx):
@@ -907,23 +1051,25 @@ async def list_models(ctx):
 
 @bot.command(name="setmodel")
 async def set_model(ctx, model_id: str = None):
-    global ACTIVE_MODEL
+    global ACTIVE_MODEL, CACHED_FAST_MODEL
     if not model_id:
-        current = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({', '.join(FALLBACK_MODELS)})"
+        current = ACTIVE_MODEL if ACTIVE_MODEL else f"Auto ({CACHED_FAST_MODEL or FALLBACK_MODELS[0]})"
         await ctx.send(f"ℹ️ Model hiện tại: **`{current}`**\nDùng `!setmodel tên_model` để đổi hoặc `!setmodel auto` để tự động.")
         return
 
     if model_id.lower() == "auto":
         ACTIVE_MODEL = ""
+        CACHED_FAST_MODEL = ""
         save_data()
-        await ctx.send(f"✅ Đã chuyển về chế độ **Auto Fallback**: `{', '.join(FALLBACK_MODELS)}`")
+        await ctx.send(f"✅ Đã chuyển về chế độ **Auto Fallback**.")
         return
 
     await ctx.send(f"🔄 Đang kiểm tra kết nối tới model **`{model_id}`**...")
     async with ctx.typing():
         try:
-            await call_single_model(model_id, ["Trả lời 1 chữ: OK"])
+            await call_single_model(model_id, ["Trả lời 1 chữ: OK"], max_tokens=10)
             ACTIVE_MODEL = model_id
+            CACHED_FAST_MODEL = ""
             save_data()
             source = "OpenRouter" if is_openrouter_model(model_id) else "Google Gemini"
             await ctx.send(f"✅ Đã kích hoạt model **`{model_id}`** ({source}) thành công!")
@@ -935,14 +1081,14 @@ async def set_model(ctx, model_id: str = None):
 
 @bot.command(name="checkapi")
 async def check_api(ctx):
-    start_t = datetime.now()
+    start_t = time.monotonic()
     try:
-        res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"])
-        elapsed = round((datetime.now() - start_t).total_seconds(), 2)
+        res = await async_safe_generate_content(["Ping test. Trả lời đúng 1 chữ: OK"], max_tokens=10)
+        elapsed = round(time.monotonic() - start_t, 2)
         apify_status = "✅ Đã gắn" if APIFY_API_TOKEN else "⚪ Chưa gắn"
         or_status = "✅ Đã gắn" if OPENROUTER_API_KEY else "⚪ Chưa gắn (tùy chọn)"
         await ctx.send(
-            f"⚡ **Model phản hồi:** `{res.model_used}` (`{elapsed}s`) | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n"
+            f"⚡ **Phản hồi AI:** `{elapsed}s` | **Ping Discord:** `{round(bot.latency * 1000)}ms`\n"
             f"🔑 **Apify:** {apify_status} | **OpenRouter:** {or_status}"
         )
     except Exception as e:
@@ -956,40 +1102,42 @@ async def ask_ai(ctx, *, prompt: str = None):
         await ctx.send("⚠️ Vui lòng nhập câu hỏi, đính kèm ảnh hoặc dán link Google Drive.")
         return
 
-    async with ctx.typing():
-        try:
-            if ctx.author.id not in USER_CHATS:
-                USER_CHATS[ctx.author.id] = []
-            
-            history = USER_CHATS[ctx.author.id]
-            full_context = ""
-            for h in history[-3:]:
-                full_context += f"User: {h['user']}\nAssistant: {h['assistant']}\n"
-            
-            clean_prompt = strip_gdrive_links(prompt) if has_drive else (prompt or "")
-            user_text = clean_prompt if clean_prompt else "Phân tích hình ảnh này dưới góc độ chuyên môn."
-            full_context += f"User: {user_text}\nAssistant:"
+    start_t = time.monotonic()
+    send_task = asyncio.create_task(ctx.send("⚡ ..."))
+    img_task = None
+    if has_attachment or has_drive:
+        att = ctx.message.attachments[0] if has_attachment else None
+        img_task = asyncio.create_task(fetch_safe_image_bytes(att, prompt or "", max_size=640, quality=75))
 
-            contents = [full_context]
-            if has_attachment or has_drive:
-                attachment = ctx.message.attachments[0] if has_attachment else None
-                jpeg_bytes = await fetch_safe_image_bytes(attachment, prompt or "", max_size=1024, quality=80)
-                contents.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
+    status_msg = await send_task
+    try:
+        if ctx.author.id not in USER_CHATS:
+            USER_CHATS[ctx.author.id] = []
+        history = USER_CHATS[ctx.author.id]
+        full_context = "".join(f"User: {h['user']}\nAssistant: {h['assistant']}\n" for h in history[-2:])
 
-            response = await async_safe_generate_content(contents)
-            reply_text = response.text if response and response.text else "Lỗi phản hồi."
-            
-            history.append({"user": user_text, "assistant": reply_text})
-            if len(history) > 4: 
-                history.pop(0)
+        clean_prompt = strip_gdrive_links(prompt) if has_drive else (prompt or "")
+        user_text = clean_prompt if clean_prompt else "Phân tích hình ảnh này ngắn gọn dưới góc độ chuyên môn."
+        full_context += f"User: {user_text}\nAssistant (trả lời súc tích, đúng trọng tâm):"
 
-            await send_long_message(ctx, reply_text)
-        except Exception as e:
-            await ctx.send(f"❌ Lỗi AI: `{str(e)[:300]}`")
+        contents = [full_context]
+        if img_task:
+            jpeg_bytes = await img_task
+            contents.append(types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"))
+
+        reply_text = await stream_fast_reply(
+            ctx, status_msg, contents, start_t,
+            max_tokens=550, temperature=0.6, show_timer=True
+        )
+        history.append({"user": user_text, "assistant": reply_text[:500]})
+        if len(history) > 3:
+            history.pop(0)
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi AI: `{str(e)[:300]}`")
 
 @bot.command(name="wip", aliases=["checkwip"])
 async def check_wip(ctx, *, text: str = ""):
-    """Soi WIP gọn trong 1 lệnh (!wip hoặc !checkwip), có nút bấm Soi sâu hơn ngay dưới kết quả"""
+    """Soi WIP siêu tốc dưới 3-4s (chạy chữ live + nút Soi sâu hơn)"""
     has_attachment = bool(ctx.message.attachments)
     has_drive = bool(extract_gdrive_id(text))
     if not has_attachment and not has_drive:
@@ -1001,108 +1149,41 @@ async def check_wip(ctx, *, text: str = ""):
 
     start_t = time.monotonic()
     attachment = ctx.message.attachments[0] if has_attachment else None
-    status_msg = await ctx.send("⚡ Đang soi WIP...")
+
+    # Chạy song song gửi tin nhắn chờ & tải ảnh để tiết kiệm ~0.4s
+    send_task = asyncio.create_task(ctx.send("⚡ Đang soi WIP..."))
+    img_task = asyncio.create_task(fetch_safe_image_bytes(attachment, text, max_size=512, quality=72))
+    status_msg = await send_task
 
     try:
-        jpeg_bytes = await fetch_safe_image_bytes(attachment, text, max_size=768, quality=75)
+        jpeg_bytes = await img_task
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
 
         note = strip_gdrive_links(text)
-        extra_note = f"\nGhi chú thêm từ Artist: {note}" if note else ""
+        extra_note = f"\nGhi chú: {note}" if note else ""
 
         prompt_wip = (
-            f"Soi WIP siêu ngắn gọn (tối đa 160 chữ), gạch đầu dòng thẳng vào lỗi cần sửa:{extra_note}\n"
+            f"Soi WIP cực ngắn gọn (tối đa 120 chữ), gạch đầu dòng thẳng lỗi cần sửa:{extra_note}\n"
             "• Bố cục/Layout:\n"
             "• Ánh sáng/Contrast:\n"
             "• Màu/DI/Blending:\n"
             "• Fix gấp:"
         )
 
-        full_text = ""
-        errors = []
-
-        for model_name in FAST_WIP_MODELS:
-            try:
-                cfg_kwargs = {
-                    "system_instruction": SYSTEM_PROMPT,
-                    "temperature": 0.5,
-                    "max_output_tokens": 450,
-                }
-                try:
-                    if hasattr(types, "ThinkingConfig"):
-                        config = types.GenerateContentConfig(
-                            **cfg_kwargs,
-                            thinking_config=types.ThinkingConfig(thinking_budget=0)
-                        )
-                    else:
-                        config = types.GenerateContentConfig(**cfg_kwargs)
-
-                    stream = await asyncio.wait_for(
-                        client_ai.aio.models.generate_content_stream(
-                            model=model_name,
-                            contents=[prompt_wip, image_part],
-                            config=config
-                        ),
-                        timeout=15.0
-                    )
-                except Exception as te:
-                    if any(k in str(te).lower() for k in ("thinking", "400", "invalid", "unsupported")):
-                        config = types.GenerateContentConfig(**cfg_kwargs)
-                        stream = await asyncio.wait_for(
-                            client_ai.aio.models.generate_content_stream(
-                                model=model_name,
-                                contents=[prompt_wip, image_part],
-                                config=config
-                            ),
-                            timeout=15.0
-                        )
-                    else:
-                        raise te
-
-                last_edit = time.monotonic()
-
-                async for chunk in stream:
-                    if chunk.text:
-                        full_text += chunk.text
-                        now_t = time.monotonic()
-                        if now_t - last_edit >= 0.9 and full_text.strip():
-                            try:
-                                await status_msg.edit(content=f"{full_text[:1950]} ▌")
-                            except Exception:
-                                pass
-                            last_edit = now_t
-                break
-            except asyncio.TimeoutError:
-                errors.append(f"{model_name}: Timeout 15s")
-                full_text = ""
-                continue
-            except Exception as e:
-                errors.append(f"{model_name}: {str(e)[:70]}")
-                full_text = ""
-                continue
-
-        if not full_text:
-            raise Exception(" | ".join(errors) or "Không nhận được phản hồi từ AI.")
-
-        elapsed = round(time.monotonic() - start_t, 2)
-        footer = f"\n\n*⚡ `{elapsed}s`*"
         view = DeepWipView(attachment, text)
-
-        if len(full_text) + len(footer) <= 2000:
-            await status_msg.edit(content=full_text + footer, view=view)
-        else:
-            await status_msg.edit(content=full_text[:1990])
-            await send_long_message(ctx, full_text[1990:] + footer)
-            await ctx.send("Bấm bên dưới nếu cần phân tích chi tiết hơn:", view=view)
-
+        await stream_fast_reply(
+            ctx, status_msg, [prompt_wip, image_part], start_t,
+            max_tokens=280, temperature=0.4, show_timer=True, view=view
+        )
     except Exception as e:
         await status_msg.edit(content=f"❌ Lỗi soi WIP: `{str(e)[:300]}`")
 
 @bot.command(name="tomtat", aliases=["tt", "dangnoigi"])
 async def summarize_channel(ctx, *, query: str = ""):
-    """Đọc lịch sử tin nhắn để tóm tắt hoặc trả lời câu hỏi về cuộc trò chuyện"""
+    """Tóm tắt kênh siêu tốc bằng Streaming"""
+    start_t = time.monotonic()
     target_channel = ctx.channel
-    limit = 60
+    limit = 50
 
     if ctx.message.channel_mentions:
         target_channel = ctx.message.channel_mentions[0]
@@ -1115,51 +1196,45 @@ async def summarize_channel(ctx, *, query: str = ""):
             limit = val
             query = re.sub(r'\b' + num_match.group(1) + r'\b', '', query, count=1).strip()
 
-    await ctx.send(f"📖 Đang đọc {limit} tin nhắn gần nhất ở {target_channel.mention}...")
-    async with ctx.typing():
-        try:
-            messages = []
-            async for msg in target_channel.history(limit=limit + 1):
-                if msg.id == ctx.message.id:
-                    continue
-                content = msg.content.strip()
-                if not content and msg.attachments:
-                    content = f"[Đính kèm {len(msg.attachments)} file]"
-                if not content or content.startswith(("!tomtat", "!tt", "!dangnoigi")):
-                    continue
-                t_str = msg.created_at.astimezone(VN_TZ).strftime("%H:%M")
-                messages.append(f"[{t_str}] {msg.author.display_name}: {content[:300]}")
+    status_msg = await ctx.send(f"📖 Đang đọc {limit} tin nhắn ở {target_channel.mention}...")
+    try:
+        messages = []
+        async for msg in target_channel.history(limit=limit + 1):
+            if msg.id == ctx.message.id:
+                continue
+            content = msg.content.strip()
+            if not content and msg.attachments:
+                content = f"[{len(msg.attachments)} file]"
+            if not content or content.startswith(("!tomtat", "!tt", "!dangnoigi")):
+                continue
+            t_str = msg.created_at.astimezone(VN_TZ).strftime("%H:%M")
+            messages.append(f"[{t_str}] {msg.author.display_name}: {content[:200]}")
 
-            if not messages:
-                await ctx.send("📭 Không có tin nhắn nào để đọc trong kênh này.")
-                return
+        if not messages:
+            await status_msg.edit(content="📭 Không có tin nhắn nào để đọc trong kênh này.")
+            return
 
-            messages.reverse()
-            chat_log = "\n".join(messages)
+        messages.reverse()
+        chat_log = "\n".join(messages)
 
-            if query:
-                prompt = (
-                    f"Lịch sử chat gần nhất của kênh #{target_channel.name}:\n"
-                    f"---\n{chat_log}\n---\n"
-                    f"Dựa vào đoạn chat trên, trả lời ngắn gọn, chính xác câu hỏi: {query}"
-                )
-            else:
-                prompt = (
-                    f"Lịch sử chat gần nhất của kênh #{target_channel.name}:\n"
-                    f"---\n{chat_log}\n---\n"
-                    "Tóm tắt nhanh, gọn, đúng trọng tâm theo góc nhìn Producer:\n"
-                    "1. Mọi người đang bàn về chuyện gì?\n"
-                    "2. Các ý đã chốt (nếu có).\n"
-                    "3. Đầu việc / Ai đang phụ trách gì."
-                )
+        if query:
+            prompt = f"Chat #{target_channel.name}:\n{chat_log}\n---\nTrả lời ngắn gọn câu hỏi: {query}"
+        else:
+            prompt = (
+                f"Chat #{target_channel.name}:\n{chat_log}\n---\n"
+                "Tóm tắt siêu ngắn gọn (tối đa 150 chữ):\n"
+                "1. Đang bàn chuyện gì?\n2. Ý đã chốt.\n3. Đầu việc & người phụ trách."
+            )
 
-            res = await async_safe_generate_content([prompt])
-            await send_long_message(ctx, f"📝 **TÓM TẮT #{target_channel.name}** ({len(messages)} tin nhắn):\n\n{res.text}")
-
-        except discord.Forbidden:
-            await ctx.send(f"⛔ Bot chưa có quyền đọc {target_channel.mention}. Hãy cấp quyền **View Channel** và **Read Message History** cho bot.")
-        except Exception as e:
-            await ctx.send(f"❌ Lỗi tóm tắt: `{str(e)[:250]}`")
+        prefix = f"📝 **TÓM TẮT #{target_channel.name}** ({len(messages)} tin nhắn):\n\n"
+        await stream_fast_reply(
+            ctx, status_msg, [prompt], start_t,
+            max_tokens=350, temperature=0.4, prefix=prefix, show_timer=True
+        )
+    except discord.Forbidden:
+        await status_msg.edit(content=f"⛔ Bot chưa có quyền đọc {target_channel.mention}. Hãy bật **View Channel** và **Read Message History**.")
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi tóm tắt: `{str(e)[:250]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
@@ -1171,23 +1246,23 @@ async def reset_ai(ctx):
 
 @bot.command(name="taoprompt")
 async def tao_prompt(ctx, *, idea: str):
-    async with ctx.typing():
-        try:
-            prompt_req = f"Tạo prompt AI tiếng Anh chi tiết (gồm Subject, Environment, Lighting, Camera Angle, Render Style) từ ý tưởng: '{idea}'."
-            response = await async_safe_generate_content([prompt_req])
-            await send_long_message(ctx, response.text)
-        except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
+    start_t = time.monotonic()
+    status_msg = await ctx.send("⚡ Đang tạo prompt...")
+    try:
+        prompt_req = f"Tạo prompt AI tiếng Anh chi tiết nhưng súc tích (Subject, Environment, Lighting, Camera, Render Style) từ ý tưởng: '{idea}'."
+        await stream_fast_reply(ctx, status_msg, [prompt_req], start_t, max_tokens=350, temperature=0.6, show_timer=True)
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="datten")
 async def dat_ten(ctx, *, filename: str):
-    async with ctx.typing():
-        try:
-            prompt_req = f"Chuyển đổi tên file '{filename}' sang chuẩn đặt tên Production House (YYYYMMDD_Project_Asset_Version, không dấu, dùng underscore)."
-            response = await async_safe_generate_content([prompt_req])
-            await send_long_message(ctx, response.text)
-        except Exception as e:
-            await ctx.send(f"❌ Lỗi: `{str(e)[:300]}`")
+    start_t = time.monotonic()
+    status_msg = await ctx.send("⚡ ...")
+    try:
+        prompt_req = f"Chuyển '{filename}' sang chuẩn đặt tên Production House (YYYYMMDD_Project_Asset_Version, không dấu, underscore). Chỉ trả về đúng tên file."
+        await stream_fast_reply(ctx, status_msg, [prompt_req], start_t, max_tokens=100, temperature=0.2, show_timer=True)
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi: `{str(e)[:300]}`")
 
 @bot.command(name="nopfile")
 async def nop_file(ctx, *, project_name: str = "Dự án chung"):
@@ -1249,7 +1324,7 @@ async def soi_tiktok(ctx, url: str):
                 "2. Dự đoán Hook & Mood chính.\n"
                 "3. Gợi ý 1 hướng chuyển hóa sang Visual/TVC cho Studio."
             )
-            ai_res = await async_safe_generate_content([prompt])
+            ai_res = await async_safe_generate_content([prompt], max_tokens=500)
             await send_long_message(ctx, f"🎵 **THÔNG SỐ TIKTOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
             await ctx.send(f"❌ Lỗi soi TikTok: `{str(e)[:300]}`")
@@ -1275,7 +1350,7 @@ async def soi_fb(ctx, url: str):
                 f"Thông số bài viết Facebook tham khảo cho Invisible Space Studio:\n{stats}\n\n"
                 "Phân tích ngắn gọn: Điểm mạnh của góc tiếp cận/copywriting, đánh giá tương tác và gợi ý cách áp dụng cho bài đăng của Studio."
             )
-            ai_res = await async_safe_generate_content([prompt])
+            ai_res = await async_safe_generate_content([prompt], max_tokens=500)
             await send_long_message(ctx, f"📘 **THÔNG SỐ FACEBOOK:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
             await ctx.send(f"❌ Lỗi soi Facebook: `{str(e)[:300]}`")
@@ -1302,7 +1377,7 @@ async def soi_ig(ctx, url: str):
                 f"Thông số bài Instagram tham khảo cho Invisible Space Studio:\n{stats}\n\n"
                 "Phân tích ngắn gọn dưới góc nhìn Art Director: Cách dẫn dắt nội dung, mức độ hiệu quả và 1 gợi ý làm Visual/Reels tương tự."
             )
-            ai_res = await async_safe_generate_content([prompt])
+            ai_res = await async_safe_generate_content([prompt], max_tokens=500)
             await send_long_message(ctx, f"📸 **THÔNG SỐ INSTAGRAM:**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
             await ctx.send(f"❌ Lỗi soi Instagram: `{str(e)[:300]}`")
@@ -1329,7 +1404,7 @@ async def soi_x(ctx, url: str):
                 f"Thông số bài đăng X (Twitter) tham khảo cho Invisible Space Studio:\n{stats}\n\n"
                 "Phân tích ngắn gọn: Tại sao bài này thu hút (hoặc chưa thu hút), insight chính và gợi ý ứng dụng cho kênh truyền thông/portfolio quốc tế của Studio."
             )
-            ai_res = await async_safe_generate_content([prompt])
+            ai_res = await async_safe_generate_content([prompt], max_tokens=500)
             await send_long_message(ctx, f"🐦 **THÔNG SỐ X (TWITTER):**\n{stats}\n\n🎬 **PHÂN TÍCH STUDIO:**\n{ai_res.text}")
         except Exception as e:
             await ctx.send(f"❌ Lỗi soi X: `{str(e)[:300]}`")
@@ -1353,8 +1428,12 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    async with bot:
-        await bot.start(DISCORD_TOKEN)
+    try:
+        async with bot:
+            await bot.start(DISCORD_TOKEN)
+    finally:
+        if HTTP_SESSION and not HTTP_SESSION.closed:
+            await HTTP_SESSION.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
