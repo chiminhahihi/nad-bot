@@ -55,6 +55,17 @@ FAST_WIP_MODELS = [
     "gemini-3.5-flash",
 ]
 
+# Danh sách các Role cho bảng nút bấm !setuproles (bạn có thể đổi tên trực tiếp tại đây)
+STUDIO_ROLES = [
+    {"id": "role_art_director", "name": "Art Director", "emoji": "🎨"},
+    {"id": "role_visual_artist", "name": "Visual Artist", "emoji": "🎬"},
+    {"id": "role_3d_artist", "name": "3D Artist", "emoji": "🧊"},
+    {"id": "role_di_retouch", "name": "DI / Retouch", "emoji": "✨"},
+    {"id": "role_producer", "name": "Producer", "emoji": "📋"},
+]
+
+MEETING_PREFIX = "🎙️ Họp - "
+
 client_ai = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==============================================================================
@@ -89,6 +100,8 @@ def save_data():
 
 TASKS, meetings, SUBMISSIONS, ACTIVE_MODEL = load_data()
 USER_CHATS = {}
+TEMP_VOICE_CHANNELS = set()
+VIEWS_REGISTERED = False
 
 # ==============================================================================
 # 4. CẤU HÌNH BOT DISCORD & PHÂN QUYỀN
@@ -96,6 +109,7 @@ USER_CHATS = {}
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -107,7 +121,6 @@ ALLOWED_USER_IDS = {
 
 @bot.check
 async def globally_block_unauthorized(ctx):
-    # Mở quyền cho tất cả thành viên trong server đều dùng được lệnh tóm tắt
     if ctx.command and ctx.command.name == "tomtat":
         return True
     if ALLOWED_USER_IDS and ctx.author.id not in ALLOWED_USER_IDS:
@@ -368,7 +381,9 @@ async def run_apify_actor(actor_id: str, payload: dict):
                 raise Exception(f"Lỗi Apify (HTTP {resp.status}). Kiểm tra lại link hoặc Token.")
             return await resp.json()
 
-# Nút bấm "Soi sâu hơn" gắn ngay dưới kết quả !wip
+# ==============================================================================
+# 6.5. CÁC BẢNG NÚT BẤM TƯƠNG TÁC (WIP, NHẬN ROLE, TẠO PHÒNG HỌP)
+# ==============================================================================
 class DeepWipView(discord.ui.View):
     def __init__(self, attachment, text: str):
         super().__init__(timeout=300)
@@ -414,11 +429,114 @@ class DeepWipView(discord.ui.View):
                 pass
             await interaction.channel.send(f"❌ Lỗi soi sâu: `{str(e)[:300]}`")
 
+class RoleButton(discord.ui.Button):
+    def __init__(self, role_cfg: dict):
+        super().__init__(
+            label=role_cfg["name"],
+            emoji=role_cfg["emoji"],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"nad_{role_cfg['id']}"
+        )
+        self.role_name = role_cfg["name"]
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        member = interaction.user
+        role = discord.utils.get(guild.roles, name=self.role_name)
+
+        try:
+            if not role:
+                role = await guild.create_role(name=self.role_name, mentionable=True)
+
+            if role in member.roles:
+                await member.remove_roles(role)
+                await interaction.response.send_message(f"➖ Đã gỡ role **{role.name}**.", ephemeral=True)
+            else:
+                await member.add_roles(role)
+                await interaction.response.send_message(f"✅ Đã nhận role **{role.name}**!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "⛔ Bot chưa đủ quyền gán role này. Hãy bật **Manage Roles** và kéo role của bot lên trên cùng trong Server Settings.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Lỗi cập nhật role: `{str(e)[:200]}`", ephemeral=True)
+
+class RoleSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for cfg in STUDIO_ROLES:
+            self.add_item(RoleButton(cfg))
+
+async def auto_delete_empty_meeting(channel: discord.VoiceChannel, delay: int = 120):
+    """Tự động xóa phòng họp nếu sau 2 phút vẫn không có ai vào"""
+    await asyncio.sleep(delay)
+    ch = bot.get_channel(channel.id)
+    if ch and isinstance(ch, discord.VoiceChannel) and len(ch.members) == 0:
+        try:
+            await ch.delete(reason="Tự động xóa phòng họp trống")
+        except Exception:
+            pass
+        TEMP_VOICE_CHANNELS.discard(channel.id)
+
+class MeetingRoomView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Tạo phòng họp",
+        emoji="🎙️",
+        style=discord.ButtonStyle.primary,
+        custom_id="nad_create_meeting_room"
+    )
+    async def create_meeting_room(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        member = interaction.user
+        room_name = f"{MEETING_PREFIX}{member.display_name}"[:95]
+
+        # Nếu người này đã có sẵn phòng đang mở thì dẫn tới phòng đó luôn
+        existing = discord.utils.get(guild.voice_channels, name=room_name)
+        if existing:
+            await interaction.response.send_message(
+                f"🎙️ Bạn đang có sẵn phòng họp tại {existing.mention}. Bấm vào để tham gia!",
+                ephemeral=True
+            )
+            return
+
+        try:
+            category = interaction.channel.category
+            voice_ch = await guild.create_voice_channel(
+                name=room_name,
+                category=category,
+                reason=f"Tạo phòng họp nhanh cho {member.display_name}"
+            )
+            TEMP_VOICE_CHANNELS.add(voice_ch.id)
+            asyncio.create_task(auto_delete_empty_meeting(voice_ch, delay=120))
+
+            await interaction.response.send_message(
+                f"✅ Đã tạo phòng họp: {voice_ch.mention}\n"
+                f"*(Phòng sẽ tự động xóa khi mọi người rời đi, hoặc sau 2 phút nếu không ai vào)*",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "⛔ Bot chưa có quyền tạo kênh thoại. Hãy bật quyền **Manage Channels** cho bot.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Lỗi tạo phòng họp: `{str(e)[:200]}`", ephemeral=True)
+
 # ==============================================================================
 # 7. SỰ KIỆN BOT & CÁC VÒNG LẶP CHẠY NGẦM
 # ==============================================================================
 @bot.event
 async def on_ready():
+    global VIEWS_REGISTERED
+    if not VIEWS_REGISTERED:
+        bot.add_view(RoleSelectView())
+        bot.add_view(MeetingRoomView())
+        VIEWS_REGISTERED = True
+
     print(f"[SYSTEM] Bot đã sẵn sàng: {bot.user}")
     print(f"[SYSTEM] Model ưu tiên: {ACTIVE_MODEL or 'Auto'} | Dự phòng: {', '.join(FALLBACK_MODELS)}")
     if not check_deadlines.is_running():
@@ -427,6 +545,19 @@ async def on_ready():
         check_meetings.start()
     if not keep_alive_ping.is_running():
         keep_alive_ping.start()
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Tự động xóa phòng họp tạm ngay khi người cuối cùng thoát ra"""
+    left_ch = before.channel
+    if left_ch and left_ch != after.channel:
+        is_temp = (left_ch.id in TEMP_VOICE_CHANNELS) or left_ch.name.startswith(MEETING_PREFIX)
+        if is_temp and len(left_ch.members) == 0:
+            try:
+                await left_ch.delete(reason="Phòng họp đã kết thúc (không còn thành viên)")
+            except Exception:
+                pass
+            TEMP_VOICE_CHANNELS.discard(left_ch.id)
 
 @tasks.loop(minutes=5)
 async def keep_alive_ping():
@@ -555,7 +686,7 @@ async def show_help(ctx):
         name="🧠 3. AI, Duyệt WIP & Tóm tắt kênh",
         value=(
             "• `!wip` (hoặc `!checkwip`) — Thả ảnh/link Drive soi siêu tốc, cần soi kỹ bấm nút ngay dưới bài\n"
-            "• `!tomtat` (hoặc `!tt`, `!dangnoigi`) — Tóm tắt chat kênh hiện tại, tag `#kênh` hoặc đặt câu hỏi về cuộc trò chuyện *(ai trong server cũng dùng được)*\n"
+            "• `!tomtat` (hoặc `!tt`, `!dangnoigi`) — Tóm tắt chat kênh hiện tại, tag `#kênh` hoặc đặt câu hỏi\n"
             "• `!ai câu hỏi` — Hỏi đáp AI (kèm ảnh hoặc link Drive được)\n"
             "• `!taoprompt ý tưởng` | `!datten tên file` | `!resetai`\n"
             "• `!listmodel` | `!setmodel tên_model` | `!checkapi`"
@@ -570,14 +701,48 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="📁 5. File & Link Dự án",
+        name="⚙️ 5. Tự động hóa Server & File",
         value=(
+            "• `!setuproles` — Gửi bảng nút bấm tự nhận/gỡ Role bộ phận\n"
+            "• `!setuphop` — Gửi bảng nút bấm tự tạo phòng họp thoại (tự xóa khi trống)\n"
             "• `!nopfile Tên dự án` (kèm file/link) | `!tonghoplink`"
         ),
         inline=False
     )
     embed.set_footer(text=f"Múi giờ: UTC+7 ({now_vn().strftime('%H:%M - %d/%m/%Y')})")
     await ctx.send(embed=embed)
+
+# ==============================================================================
+# 8.5. CÁC LỆNH QUẢN LÝ SERVER (BẢNG ROLE & NÚT TẠO PHÒNG HỌP)
+# ==============================================================================
+@bot.command(name="setuproles")
+async def setup_roles(ctx):
+    """Gửi bảng nút bấm tự nhận/gỡ Role chuyên môn"""
+    embed = discord.Embed(
+        title="🎭 CHỌN BỘ PHẬN / ROLE CỦA BẠN",
+        description=(
+            "Bấm vào các nút bên dưới để **nhận Role** (hoặc bấm lại lần nữa để **gỡ Role**).\n"
+            "Nhận đúng Role để mở khóa các kênh làm việc tương ứng trong Studio."
+        ),
+        color=discord.Color.blurple()
+    )
+    roles_list = "\n".join(f"{r['emoji']} **{r['name']}**" for r in STUDIO_ROLES)
+    embed.add_field(name="Danh sách vị trí", value=roles_list, inline=False)
+    await ctx.send(embed=embed, view=RoleSelectView())
+
+@bot.command(name="setuphop")
+async def setup_meeting_panel(ctx):
+    """Gửi bảng nút bấm tạo phòng họp thoại tạm thời"""
+    embed = discord.Embed(
+        title="🎙️ TẠO PHÒNG HỌP NHANH",
+        description=(
+            "Bấm nút **Tạo phòng họp** bên dưới để mở ngay một phòng thoại riêng.\n"
+            "• Phòng sẽ **tự động xóa** ngay khi người cuối cùng thoát ra.\n"
+            "• Nếu không có ai vào sau 2 phút, phòng cũng tự dọn dẹp."
+        ),
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed, view=MeetingRoomView())
 
 # ==============================================================================
 # 9. CÁC LỆNH QUẢN LÝ TASK
