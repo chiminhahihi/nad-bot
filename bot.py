@@ -107,6 +107,9 @@ ALLOWED_USER_IDS = {
 
 @bot.check
 async def globally_block_unauthorized(ctx):
+    # Mở quyền cho tất cả thành viên trong server đều dùng được lệnh tóm tắt
+    if ctx.command and ctx.command.name == "tomtat":
+        return True
     if ALLOWED_USER_IDS and ctx.author.id not in ALLOWED_USER_IDS:
         await ctx.send("⛔ Bạn không có quyền sử dụng bot này.")
         return False
@@ -549,9 +552,10 @@ async def show_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="🧠 3. AI & Duyệt WIP",
+        name="🧠 3. AI, Duyệt WIP & Tóm tắt kênh",
         value=(
-            "• `!wip` (hoặc `!checkwip`) — Thả ảnh hoặc dán link Drive để soi siêu tốc, cần soi kỹ bấm nút ngay dưới bài\n"
+            "• `!wip` (hoặc `!checkwip`) — Thả ảnh/link Drive soi siêu tốc, cần soi kỹ bấm nút ngay dưới bài\n"
+            "• `!tomtat` (hoặc `!tt`, `!dangnoigi`) — Tóm tắt chat kênh hiện tại, tag `#kênh` hoặc đặt câu hỏi về cuộc trò chuyện *(ai trong server cũng dùng được)*\n"
             "• `!ai câu hỏi` — Hỏi đáp AI (kèm ảnh hoặc link Drive được)\n"
             "• `!taoprompt ý tưởng` | `!datten tên file` | `!resetai`\n"
             "• `!listmodel` | `!setmodel tên_model` | `!checkapi`"
@@ -708,7 +712,7 @@ async def list_meetings(ctx):
     await send_long_message(ctx, msg)
 
 # ==============================================================================
-# 11. CÁC LỆNH AI & QUẢN LÝ MODEL
+# 11. CÁC LỆNH AI, QUẢN LÝ MODEL & TÓM TẮT KÊNH
 # ==============================================================================
 @bot.command(name="listmodel")
 async def list_models(ctx):
@@ -917,6 +921,69 @@ async def check_wip(ctx, *, text: str = ""):
 
     except Exception as e:
         await status_msg.edit(content=f"❌ Lỗi soi WIP: `{str(e)[:300]}`")
+
+@bot.command(name="tomtat", aliases=["tt", "dangnoigi"])
+async def summarize_channel(ctx, *, query: str = ""):
+    """Đọc lịch sử tin nhắn để tóm tắt hoặc trả lời câu hỏi về cuộc trò chuyện"""
+    target_channel = ctx.channel
+    limit = 60
+
+    if ctx.message.channel_mentions:
+        target_channel = ctx.message.channel_mentions[0]
+        query = re.sub(r'<#\d+>', '', query).strip()
+
+    num_match = re.search(r'\b(\d{1,3})\b', query)
+    if num_match:
+        val = int(num_match.group(1))
+        if 5 <= val <= 200:
+            limit = val
+            query = re.sub(r'\b' + num_match.group(1) + r'\b', '', query, count=1).strip()
+
+    await ctx.send(f"📖 Đang đọc {limit} tin nhắn gần nhất ở {target_channel.mention}...")
+    async with ctx.typing():
+        try:
+            messages = []
+            async for msg in target_channel.history(limit=limit + 1):
+                if msg.id == ctx.message.id:
+                    continue
+                content = msg.content.strip()
+                if not content and msg.attachments:
+                    content = f"[Đính kèm {len(msg.attachments)} file]"
+                if not content or content.startswith(("!tomtat", "!tt", "!dangnoigi")):
+                    continue
+                t_str = msg.created_at.astimezone(VN_TZ).strftime("%H:%M")
+                messages.append(f"[{t_str}] {msg.author.display_name}: {content[:300]}")
+
+            if not messages:
+                await ctx.send("📭 Không có tin nhắn nào để đọc trong kênh này.")
+                return
+
+            messages.reverse()
+            chat_log = "\n".join(messages)
+
+            if query:
+                prompt = (
+                    f"Lịch sử chat gần nhất của kênh #{target_channel.name}:\n"
+                    f"---\n{chat_log}\n---\n"
+                    f"Dựa vào đoạn chat trên, trả lời ngắn gọn, chính xác câu hỏi: {query}"
+                )
+            else:
+                prompt = (
+                    f"Lịch sử chat gần nhất của kênh #{target_channel.name}:\n"
+                    f"---\n{chat_log}\n---\n"
+                    "Tóm tắt nhanh, gọn, đúng trọng tâm theo góc nhìn Producer:\n"
+                    "1. Mọi người đang bàn về chuyện gì?\n"
+                    "2. Các ý đã chốt (nếu có).\n"
+                    "3. Đầu việc / Ai đang phụ trách gì."
+                )
+
+            res = await async_safe_generate_content([prompt])
+            await send_long_message(ctx, f"📝 **TÓM TẮT #{target_channel.name}** ({len(messages)} tin nhắn):\n\n{res.text}")
+
+        except discord.Forbidden:
+            await ctx.send(f"⛔ Bot chưa có quyền đọc {target_channel.mention}. Hãy cấp quyền **View Channel** và **Read Message History** cho bot.")
+        except Exception as e:
+            await ctx.send(f"❌ Lỗi tóm tắt: `{str(e)[:250]}`")
 
 @bot.command(name="resetai")
 async def reset_ai(ctx):
