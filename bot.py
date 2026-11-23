@@ -44,19 +44,15 @@ MAX_RAW_DOWNLOAD_MB = 25     # Ngưỡng an toàn bảo vệ 512MB RAM của Ren
 MAX_RAW_PIXELS = 45_000_000  # Chặn bung pixel >45MP với PNG/TIFF tránh sập RAM
 
 FALLBACK_MODELS = [
-    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.8-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
 ]
 
 FAST_WIP_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.8-flash",
-    "gemini-2.5-flash",
 ]
 
 # Danh sách các Role cho bảng nút bấm !setuproles
@@ -131,6 +127,7 @@ ALLOWED_USER_IDS = {
     572791257558941736,
     792068366335475723,
     649222792071348236,
+    733709657880920066,
 }
 
 @bot.check
@@ -171,7 +168,7 @@ def strip_gdrive_links(text: str) -> str:
     return ' '.join(cleaned.split()).strip()
 
 def compress_to_jpeg_bytes(image_bytes: bytes, max_size: int = 768, quality: int = 75) -> bytes:
-    """Nén ảnh sang JPEG nhẹ an toàn, chống tràn RAM khi gặp file độ phân giải cực lớn"""
+    """Nén ảnh sang JPEG chuẩn, nhẹ và an toàn, chống tràn RAM & lỗi 400 Bad Request"""
     with Image.open(io.BytesIO(image_bytes)) as img:
         if img.format == "JPEG":
             img.draft("RGB", (max_size, max_size))
@@ -192,9 +189,9 @@ async def fetch_safe_image_bytes(
     attachment: discord.Attachment = None,
     text: str = "",
     max_size: int = 512,
-    quality: int = 72
+    quality: int = 75
 ) -> bytes:
-    """Kéo ảnh JPEG đã nén sẵn từ CDN Discord/Google Drive — bỏ qua Pillow nếu đã đủ nhẹ để tiết kiệm 1s"""
+    """Kéo ảnh từ CDN Discord/Google Drive và luôn chuẩn hóa sang JPEG sạch"""
     session = await get_http_session()
 
     drive_id = extract_gdrive_id(text)
@@ -204,8 +201,6 @@ async def fetch_safe_image_bytes(
             ctype = resp.headers.get("Content-Type", "").lower()
             if resp.status == 200 and "image" in ctype:
                 raw = await resp.read()
-                if ("jpeg" in ctype or "jpg" in ctype) and len(raw) < 400_000:
-                    return raw
                 res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
                 del raw
                 return res
@@ -223,9 +218,6 @@ async def fetch_safe_image_bytes(
                 ctype = resp.headers.get("Content-Type", "").lower()
                 if resp.status == 200 and "image" in ctype and clen < 5 * 1024 * 1024:
                     raw = await resp.read()
-                    # Nếu Discord CDN đã trả về JPEG nhẹ (<400KB), dùng thẳng không cần qua Pillow
-                    if ("jpeg" in ctype or "jpg" in ctype) and len(raw) < 400_000:
-                        return raw
                     if len(raw) < 5 * 1024 * 1024:
                         res = await asyncio.to_thread(compress_to_jpeg_bytes, raw, max_size, quality)
                         del raw
@@ -423,7 +415,6 @@ async def stream_fast_reply(
     """Trả lời siêu tốc bằng Streaming (chữ chạy sau ~1s, xong trong 2-4s)"""
     global CACHED_FAST_MODEL
 
-    # Nếu admin chọn đích danh OpenRouter thì gọi qua nhánh thường
     if ACTIVE_MODEL and is_openrouter_model(ACTIVE_MODEL):
         res = await call_single_model(ACTIVE_MODEL, contents, max_tokens=max_tokens, temperature=temperature)
         elapsed = round(time.monotonic() - start_t, 2)
@@ -1150,9 +1141,8 @@ async def check_wip(ctx, *, text: str = ""):
     start_t = time.monotonic()
     attachment = ctx.message.attachments[0] if has_attachment else None
 
-    # Chạy song song gửi tin nhắn chờ & tải ảnh để tiết kiệm ~0.4s
     send_task = asyncio.create_task(ctx.send("⚡ Đang soi WIP..."))
-    img_task = asyncio.create_task(fetch_safe_image_bytes(attachment, text, max_size=512, quality=72))
+    img_task = asyncio.create_task(fetch_safe_image_bytes(attachment, text, max_size=512, quality=75))
     status_msg = await send_task
 
     try:
